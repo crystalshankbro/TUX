@@ -1,0 +1,1484 @@
+#!/usr/bin/env bash
+
+# ═══════════════════════════════════════════════════════════════════
+#   TUX — Package Manager & APK/AAB Builder  v3.0
+#   Поддержка: Linux · Windows (Git Bash/MSYS2/WSL) · macOS
+#
+#   Новое в v3.0:
+#     • Интерактивное меню (просто запусти: tux)
+#     • Новые языки: Gradle, Python, Node.js
+#     • Сборка AAB (Android App Bundle для Google Play)
+#     • Release-подпись APK своим ключом
+#     • Логи сборки в ~/.tux/logs/
+#     • tux list — таблица всего установленного
+# ═══════════════════════════════════════════════════════════════════
+
+set -euo pipefail
+
+# ══════════════════════════════════════════════════════════════════
+#  ЦВЕТА
+# ══════════════════════════════════════════════════════════════════
+RED='\033[0;31m';    GREEN='\033[0;32m';   YELLOW='\033[1;33m'
+CYAN='\033[0;36m';   BLUE='\033[0;34m';    MAGENTA='\033[0;35m'
+WHITE='\033[1;37m';  BOLD='\033[1m';       DIM='\033[2m'
+RESET='\033[0m';     BG_BLUE='\033[44m';   BG_CYAN='\033[46m'
+REVERSE='\033[7m'
+
+# ══════════════════════════════════════════════════════════════════
+#  ОПРЕДЕЛЕНИЕ ОС
+# ══════════════════════════════════════════════════════════════════
+detect_os() {
+    case "$(uname -s)" in
+        Linux*)        OS="linux"   ;;
+        Darwin*)       OS="mac"     ;;
+        CYGWIN*|MINGW*|MSYS*) OS="windows" ;;
+        *)
+            grep -qi microsoft /proc/version 2>/dev/null \
+                && OS="linux" || OS="linux" ;;
+    esac
+    export OS
+}
+detect_os
+
+# ══════════════════════════════════════════════════════════════════
+#  ПУТИ
+# ══════════════════════════════════════════════════════════════════
+if [ "$OS" = "windows" ]; then
+    INSTALL_DIR="${USERPROFILE:-$HOME}/.tux"
+    TMP_DIR="${TEMP:-/tmp}/tux_build"
+    EXE_EXT=".exe"
+else
+    INSTALL_DIR="$HOME/.tux"
+    TMP_DIR="/tmp/tux_build"
+    EXE_EXT=""
+fi
+
+JAVA_DIR="$INSTALL_DIR/java"
+KOTLIN_DIR="$INSTALL_DIR/kotlin"
+GRADLE_DIR="$INSTALL_DIR/gradle"
+PYTHON_DIR="$INSTALL_DIR/python"
+NODE_DIR="$INSTALL_DIR/node"
+TOOLS_DIR="$INSTALL_DIR/tools"
+BIN_DIR="$INSTALL_DIR/bin"
+LOGS_DIR="$INSTALL_DIR/logs"
+
+# Maven Google (без SDK)
+D8_URL="https://maven.google.com/com/android/tools/build/r8/8.3.37/r8-8.3.37.jar"
+D8_FB="https://maven.google.com/com/android/tools/build/r8/3.3.75/r8-3.3.75.jar"
+APKSIG_URL="https://maven.google.com/com/android/apksig/apksig/8.3.0/apksig-8.3.0.jar"
+APKSIG_FB="https://maven.google.com/com/android/apksig/apksig/7.4.2/apksig-7.4.2.jar"
+ANDROID_JAR_URL="https://github.com/Sable/android-platforms/raw/master/android-34/android.jar"
+ANDROID_JAR_FB1="https://github.com/Sable/android-platforms/raw/master/android-33/android.jar"
+ANDROID_JAR_FB2="https://github.com/Sable/android-platforms/raw/master/android-32/android.jar"
+
+# ══════════════════════════════════════════════════════════════════
+#  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ══════════════════════════════════════════════════════════════════
+has_cmd() { command -v "$1" &>/dev/null; }
+
+info()    { echo -e "${CYAN}[•]${RESET} $1"; }
+success() { echo -e "${GREEN}[✓]${RESET} $1"; }
+warn()    { echo -e "${YELLOW}[!]${RESET} $1"; }
+error()   { echo -e "${RED}[✗]${RESET} $1" >&2; }
+step()    { echo -e "\n${MAGENTA}[→]${RESET} ${BOLD}$1${RESET}"; }
+divider() { echo -e "${DIM}  ──────────────────────────────────────${RESET}"; }
+
+# Логирование — пишем и в консоль и в файл
+LOG_FILE=""
+log_init() {
+    mkdir -p "$LOGS_DIR"
+    LOG_FILE="$LOGS_DIR/$(date +%Y%m%d_%H%M%S)_${1}.log"
+    echo "=== TUX LOG: $1  $(date) ===" > "$LOG_FILE"
+    echo "OS: $OS  |  Tux v3.0" >> "$LOG_FILE"
+    echo "" >> "$LOG_FILE"
+}
+
+log_line() {
+    # Пишем в лог без ANSI-кодов
+    echo "$1" | sed 's/\x1b\[[0-9;]*m//g' >> "$LOG_FILE"
+}
+
+# info/success/warn/error с дублированием в лог
+linfo()    { info "$1";    [ -n "$LOG_FILE" ] && log_line "[INFO]  $1"; }
+lsuccess() { success "$1"; [ -n "$LOG_FILE" ] && log_line "[OK]    $1"; }
+lwarn()    { warn "$1";    [ -n "$LOG_FILE" ] && log_line "[WARN]  $1"; }
+lerror()   { error "$1";   [ -n "$LOG_FILE" ] && log_line "[ERROR] $1"; }
+lstep()    { step "$1";    [ -n "$LOG_FILE" ] && log_line "\n>>> $1"; }
+
+download() {
+    local url="$1" dest="$2"
+    [ -n "$LOG_FILE" ] && log_line "DOWNLOAD: $url -> $dest"
+    if has_cmd curl; then
+        curl -fsSL --progress-bar "$url" -o "$dest"
+    elif has_cmd wget; then
+        wget -q --show-progress "$url" -O "$dest"
+    else
+        lerror "Нужен curl или wget!"; exit 1
+    fi
+}
+
+add_to_path() {
+    local p="$1"
+    for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
+        [ -f "$rc" ] && ! grep -qF "$p" "$rc" && {
+            printf '\n# Added by Tux\nexport PATH="%s:$PATH"\n' "$p" >> "$rc"
+        }
+    done
+    export PATH="$p:$PATH"
+}
+
+find_java()    {
+    [ -f "$JAVA_DIR/bin/java${EXE_EXT}" ]     && echo "$JAVA_DIR/bin/java${EXE_EXT}" && return
+    has_cmd java    && echo "java"    && return; echo ""
+}
+find_kotlinc() {
+    [ -f "$KOTLIN_DIR/bin/kotlinc" ]           && echo "$KOTLIN_DIR/bin/kotlinc" && return
+    [ -f "$KOTLIN_DIR/bin/kotlinc.bat" ]       && echo "$KOTLIN_DIR/bin/kotlinc.bat" && return
+    has_cmd kotlinc && echo "kotlinc" && return; echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  БАННЕР
+# ══════════════════════════════════════════════════════════════════
+print_banner() {
+    echo ""
+    echo -e "${CYAN}${BOLD}"
+    echo "  ████████╗██╗   ██╗██╗  ██╗"
+    echo "     ██╔══╝██║   ██║╚██╗██╔╝"
+    echo "     ██║   ██║   ██║ ╚███╔╝ "
+    echo "     ██║   ██║   ██║ ██╔██╗ "
+    echo "     ██║   ╚██████╔╝██╔╝ ██╗"
+    echo "     ╚═╝    ╚═════╝ ╚═╝  ╚═╝"
+    echo -e "${RESET}${DIM}  Package Manager v3.0  |  ${OS}${RESET}"
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  ИНТЕРАКТИВНОЕ МЕНЮ (стрелки + Enter)
+# ══════════════════════════════════════════════════════════════════
+interactive_menu() {
+    # Категории
+    local CATEGORIES=(
+        "📦  Установка языков"
+        "🔨  Сборка APK / AAB"
+        "📋  tux list — что установлено"
+        "📄  Логи сборки"
+        "🔧  Обновить инструменты APK"
+        "❓  Справка"
+        "🚪  Выход"
+    )
+
+    # Подменю установки
+    local INSTALL_ITEMS=(
+        "☕  Java (Adoptium Temurin LTS)"
+        "🎯  Kotlin (JetBrains)"
+        "🐘  Gradle (последняя стабильная)"
+        "🐍  Python (последняя стабильная)"
+        "💚  Node.js (LTS)"
+        "← Назад"
+    )
+
+    # Подменю сборки
+    local BUILD_ITEMS=(
+        "📱  APK (debug) из .kt файлов"
+        "📱  APK (release) — с подписью своим ключом"
+        "📦  AAB (Android App Bundle для Google Play)"
+        "← Назад"
+    )
+
+    local sel=0
+    local in_sub=""
+
+    # Сохраняем/восстанавливаем настройки терминала
+    local old_tty
+    old_tty=$(stty -g 2>/dev/null || echo "")
+    trap 'stty "$old_tty" 2>/dev/null; echo -e "${RESET}"; exit 0' INT TERM EXIT
+
+    while true; do
+        clear
+        print_banner
+
+        if [ -z "$in_sub" ]; then
+            echo -e "  ${BOLD}Главное меню${RESET}  ${DIM}(↑↓ для навигации, Enter для выбора)${RESET}"
+            echo ""
+            local i=0
+            for item in "${CATEGORIES[@]}"; do
+                if [ $i -eq $sel ]; then
+                    echo -e "  ${REVERSE}${CYAN}  $item  ${RESET}"
+                else
+                    echo -e "     ${DIM}$item${RESET}"
+                fi
+                ((i++))
+            done
+            echo ""
+
+            # Показываем статус установленных
+            echo -e "  ${DIM}Установлено: $(list_installed_short)${RESET}"
+            echo ""
+
+            stty -echo -icanon min 1 time 0 2>/dev/null || true
+            local key
+            IFS= read -r -s -n1 key
+            if [[ "$key" == $'\x1b' ]]; then
+                IFS= read -r -s -n2 seq
+                case "$seq" in
+                    '[A') ((sel > 0)) && ((sel--)) ;;
+                    '[B') ((sel < ${#CATEGORIES[@]}-1)) && ((sel++)) ;;
+                esac
+            elif [[ "$key" == "" || "$key" == $'\n' ]]; then
+                stty "$old_tty" 2>/dev/null || true
+                case $sel in
+                    0) in_sub="install"; sel=0 ;;
+                    1) in_sub="build";   sel=0 ;;
+                    2) clear; show_list; echo ""; read -rsp "  Нажми Enter..."; sel=0 ;;
+                    3) clear; show_logs_menu; sel=0 ;;
+                    4) clear; update_tools; echo ""; read -rsp "  Нажми Enter..."; sel=0 ;;
+                    5) clear; show_help; echo ""; read -rsp "  Нажми Enter..."; sel=0 ;;
+                    6) stty "$old_tty" 2>/dev/null; trap - INT TERM EXIT; echo -e "${RESET}"; exit 0 ;;
+                esac
+            fi
+
+        elif [ "$in_sub" = "install" ]; then
+            echo -e "  ${BOLD}Установка языков${RESET}  ${DIM}(↑↓ + Enter)${RESET}"
+            echo ""
+            local i=0
+            for item in "${INSTALL_ITEMS[@]}"; do
+                if [ $i -eq $sel ]; then
+                    echo -e "  ${REVERSE}${CYAN}  $item  ${RESET}"
+                else
+                    echo -e "     ${DIM}$item${RESET}"
+                fi
+                ((i++))
+            done
+            echo ""
+
+            stty -echo -icanon min 1 time 0 2>/dev/null || true
+            local key
+            IFS= read -r -s -n1 key
+            if [[ "$key" == $'\x1b' ]]; then
+                IFS= read -r -s -n2 seq
+                case "$seq" in
+                    '[A') ((sel > 0)) && ((sel--)) ;;
+                    '[B') ((sel < ${#INSTALL_ITEMS[@]}-1)) && ((sel++)) ;;
+                esac
+            elif [[ "$key" == "" || "$key" == $'\n' ]]; then
+                stty "$old_tty" 2>/dev/null || true
+                clear
+                case $sel in
+                    0) install_java;   echo ""; read -rsp "  Нажми Enter..." ;;
+                    1) install_kotlin; echo ""; read -rsp "  Нажми Enter..." ;;
+                    2) install_gradle; echo ""; read -rsp "  Нажми Enter..." ;;
+                    3) install_python; echo ""; read -rsp "  Нажми Enter..." ;;
+                    4) install_node;   echo ""; read -rsp "  Нажми Enter..." ;;
+                    5) in_sub=""; sel=0; continue ;;
+                esac
+                in_sub="install"
+            fi
+
+        elif [ "$in_sub" = "build" ]; then
+            echo -e "  ${BOLD}Сборка APK / AAB${RESET}  ${DIM}(↑↓ + Enter)${RESET}"
+            echo ""
+            local i=0
+            for item in "${BUILD_ITEMS[@]}"; do
+                if [ $i -eq $sel ]; then
+                    echo -e "  ${REVERSE}${CYAN}  $item  ${RESET}"
+                else
+                    echo -e "     ${DIM}$item${RESET}"
+                fi
+                ((i++))
+            done
+            echo ""
+
+            stty -echo -icanon min 1 time 0 2>/dev/null || true
+            local key
+            IFS= read -r -s -n1 key
+            if [[ "$key" == $'\x1b' ]]; then
+                IFS= read -r -s -n2 seq
+                case "$seq" in
+                    '[A') ((sel > 0)) && ((sel--)) ;;
+                    '[B') ((sel < ${#BUILD_ITEMS[@]}-1)) && ((sel++)) ;;
+                esac
+            elif [[ "$key" == "" || "$key" == $'\n' ]]; then
+                stty "$old_tty" 2>/dev/null || true
+                clear
+                case $sel in
+                    0)
+                        echo -ne "  ${CYAN}Файлы (через +): ${RESET}"
+                        read -r files
+                        [ -n "$files" ] && install_apk "$files" "debug"
+                        echo ""; read -rsp "  Нажми Enter..."
+                        ;;
+                    1)
+                        echo -ne "  ${CYAN}Файлы (через +): ${RESET}"
+                        read -r files
+                        [ -n "$files" ] && install_apk "$files" "release"
+                        echo ""; read -rsp "  Нажми Enter..."
+                        ;;
+                    2)
+                        echo -ne "  ${CYAN}Файлы (через +): ${RESET}"
+                        read -r files
+                        [ -n "$files" ] && build_aab "$files"
+                        echo ""; read -rsp "  Нажми Enter..."
+                        ;;
+                    3) in_sub=""; sel=0; continue ;;
+                esac
+                in_sub="build"
+            fi
+        fi
+    done
+}
+
+# Короткий список установленного для строки статуса
+list_installed_short() {
+    local installed=()
+    [ -f "$JAVA_DIR/bin/java${EXE_EXT}" ]   && installed+=("Java")
+    [ -d "$KOTLIN_DIR/bin" ]                && installed+=("Kotlin")
+    [ -d "$GRADLE_DIR/bin" ]                && installed+=("Gradle")
+    [ -d "$PYTHON_DIR" ]                    && installed+=("Python")
+    [ -d "$NODE_DIR/bin" ]                  && installed+=("Node.js")
+    [ ${#installed[@]} -eq 0 ] && echo "ничего" && return
+    local IFS=', '; echo "${installed[*]}"
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  TUX LIST — таблица установленного
+# ══════════════════════════════════════════════════════════════════
+show_list() {
+    print_banner
+    echo -e "  ${BOLD}Установленные компоненты${RESET}"
+    echo ""
+    divider
+    printf "  ${BOLD}%-12s %-20s %-10s %s${RESET}\n" "Пакет" "Версия" "Размер" "Путь"
+    divider
+
+    # Java
+    if [ -f "$JAVA_DIR/bin/java${EXE_EXT}" ]; then
+        local jv sz
+        jv=$("$JAVA_DIR/bin/java${EXE_EXT}" -version 2>&1 | head -1 | grep -oP '"\K[^"]+' | head -1)
+        sz=$(du -sh "$JAVA_DIR" 2>/dev/null | cut -f1)
+        printf "  ${GREEN}✓${RESET} %-10s %-20s %-10s ${DIM}%s${RESET}\n" "Java" "$jv" "$sz" "$JAVA_DIR"
+    else
+        printf "  ${RED}✗${RESET} %-10s ${DIM}%-20s${RESET}\n" "Java" "не установлена"
+    fi
+
+    # Kotlin
+    local kc; kc="$(find_kotlinc)"
+    if [ -n "$kc" ]; then
+        local kv sz
+        kv=$("$kc" -version 2>&1 | grep -oP 'kotlinc-jvm \K\S+' | head -1)
+        [ -z "$kv" ] && kv=$("$kc" -version 2>&1 | head -1 | awk '{print $NF}')
+        sz=$(du -sh "$KOTLIN_DIR" 2>/dev/null | cut -f1)
+        printf "  ${GREEN}✓${RESET} %-10s %-20s %-10s ${DIM}%s${RESET}\n" "Kotlin" "$kv" "$sz" "$KOTLIN_DIR"
+    else
+        printf "  ${RED}✗${RESET} %-10s ${DIM}%-20s${RESET}\n" "Kotlin" "не установлен"
+    fi
+
+    # Gradle
+    if [ -f "$GRADLE_DIR/bin/gradle" ] || [ -f "$GRADLE_DIR/bin/gradle.bat" ]; then
+        local gv sz
+        gv=$("$GRADLE_DIR/bin/gradle" --version 2>/dev/null | grep "^Gradle" | awk '{print $2}')
+        sz=$(du -sh "$GRADLE_DIR" 2>/dev/null | cut -f1)
+        printf "  ${GREEN}✓${RESET} %-10s %-20s %-10s ${DIM}%s${RESET}\n" "Gradle" "$gv" "$sz" "$GRADLE_DIR"
+    else
+        printf "  ${RED}✗${RESET} %-10s ${DIM}%-20s${RESET}\n" "Gradle" "не установлен"
+    fi
+
+    # Python
+    if [ -f "$PYTHON_DIR/bin/python3" ] || [ -f "$PYTHON_DIR/python.exe" ]; then
+        local pv sz pbin
+        pbin="${PYTHON_DIR}/bin/python3"; [ "$OS" = "windows" ] && pbin="$PYTHON_DIR/python.exe"
+        pv=$("$pbin" --version 2>&1 | awk '{print $2}')
+        sz=$(du -sh "$PYTHON_DIR" 2>/dev/null | cut -f1)
+        printf "  ${GREEN}✓${RESET} %-10s %-20s %-10s ${DIM}%s${RESET}\n" "Python" "$pv" "$sz" "$PYTHON_DIR"
+    else
+        printf "  ${RED}✗${RESET} %-10s ${DIM}%-20s${RESET}\n" "Python" "не установлен"
+    fi
+
+    # Node.js
+    if [ -f "$NODE_DIR/bin/node" ] || [ -f "$NODE_DIR/node.exe" ]; then
+        local nv sz nbin
+        nbin="$NODE_DIR/bin/node"; [ "$OS" = "windows" ] && nbin="$NODE_DIR/node.exe"
+        nv=$("$nbin" --version 2>/dev/null)
+        sz=$(du -sh "$NODE_DIR" 2>/dev/null | cut -f1)
+        printf "  ${GREEN}✓${RESET} %-10s %-20s %-10s ${DIM}%s${RESET}\n" "Node.js" "$nv" "$sz" "$NODE_DIR"
+    else
+        printf "  ${RED}✗${RESET} %-10s ${DIM}%-20s${RESET}\n" "Node.js" "не установлен"
+    fi
+
+    divider
+    echo ""
+
+    # APK инструменты
+    echo -e "  ${BOLD}Инструменты APK:${RESET}"
+    echo ""
+    for item in "r8.jar:R8/D8 DEX" "android.jar:Android API" "apksig.jar:APK Signer" "tux.keystore:Keystore"; do
+        local f="${item%%:*}" lbl="${item##*:}"
+        if [ -f "$TOOLS_DIR/$f" ]; then
+            local sz; sz=$(du -sh "$TOOLS_DIR/$f" | cut -f1)
+            printf "    ${GREEN}✓${RESET} %-16s ${DIM}%s${RESET}\n" "$lbl" "$sz"
+        else
+            printf "    ${YELLOW}–${RESET} %-16s ${DIM}(скачается при сборке)${RESET}\n" "$lbl"
+        fi
+    done
+
+    echo ""
+    # Логи
+    if [ -d "$LOGS_DIR" ]; then
+        local log_count; log_count=$(ls "$LOGS_DIR"/*.log 2>/dev/null | wc -l)
+        echo -e "  ${DIM}Логов сборки: ${log_count}  (${CYAN}tux logs${RESET}${DIM})${RESET}"
+    fi
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  ЛОГИ
+# ══════════════════════════════════════════════════════════════════
+show_logs_menu() {
+    print_banner
+    echo -e "  ${BOLD}Логи сборки${RESET}  ${DIM}(${LOGS_DIR})${RESET}"
+    echo ""
+
+    if [ ! -d "$LOGS_DIR" ] || [ -z "$(ls "$LOGS_DIR"/*.log 2>/dev/null)" ]; then
+        warn "Логов пока нет. Собери APK/AAB и лог появится."
+        echo ""
+        return
+    fi
+
+    divider
+    local i=1
+    local files=()
+    while IFS= read -r f; do
+        files+=("$f")
+        local size; size=$(du -sh "$f" | cut -f1)
+        local name; name=$(basename "$f")
+        printf "  ${CYAN}[%d]${RESET} %-40s ${DIM}%s${RESET}\n" "$i" "$name" "$size"
+        ((i++))
+    done < <(ls -t "$LOGS_DIR"/*.log 2>/dev/null | head -20)
+    divider
+    echo ""
+    echo -ne "  Открыть лог [1-$((i-1))] или Enter для выхода: "
+    read -r choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -lt "$i" ]; then
+        local idx=$((choice-1))
+        echo ""
+        echo -e "${DIM}$(cat "${files[$idx]}")${RESET}"
+        echo ""
+    fi
+}
+
+show_logs() {
+    print_banner
+    show_logs_menu
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  УСТАНОВКА JAVA
+# ══════════════════════════════════════════════════════════════════
+install_java() {
+    print_banner
+    log_init "install_java"
+    lstep "Установка Java (последняя LTS — Adoptium Temurin)"
+    divider
+
+    local arch
+    case "$(uname -m)" in
+        x86_64|amd64)  arch="x64"     ;;
+        aarch64|arm64) arch="aarch64" ;;
+        *)             arch="x64"     ;;
+    esac
+    local api_os; [ "$OS" = "windows" ] && api_os="windows" || api_os="linux"
+    [ "$OS" = "mac" ] && api_os="mac"
+
+    linfo "Платформа: ${BOLD}${api_os}/${arch}${RESET}"
+    linfo "Запрашиваю api.adoptium.net..."
+
+    local meta url version
+    meta=$(curl -fsSL \
+        "https://api.adoptium.net/v3/assets/latest/21/hotspot?architecture=${arch}&image_type=jdk&os=${api_os}&vendor=eclipse" \
+        2>/dev/null) || { lerror "Нет соединения с api.adoptium.net"; exit 1; }
+
+    url=$(echo "$meta"     | grep -o '"link":"[^"]*"'           | head -1 | cut -d'"' -f4)
+    version=$(echo "$meta" | grep -o '"openjdk_version":"[^"]*"' | head -1 | cut -d'"' -f4)
+    [ -z "$url" ] && { lerror "Не удалось получить URL"; exit 1; }
+    linfo "Версия: ${BOLD}${version}${RESET}"
+    log_line "URL: $url"
+
+    local ext="tar.gz"
+    [ "$OS" = "windows" ] && ext="zip"
+    [ "$OS" = "mac" ]     && ext="tar.gz"
+    local archive="$TMP_DIR/jdk.${ext}"
+    mkdir -p "$TMP_DIR"
+
+    lstep "Скачиваю JDK ${version}..."
+    download "$url" "$archive"
+
+    lstep "Распаковываю..."
+    rm -rf "$JAVA_DIR"; mkdir -p "$JAVA_DIR"
+    if [ "$ext" = "zip" ]; then
+        unzip -q "$archive" -d "$TMP_DIR/jdk_tmp"
+        local inner; inner=$(ls "$TMP_DIR/jdk_tmp" | head -1)
+        mv "$TMP_DIR/jdk_tmp/$inner"/* "$JAVA_DIR/" 2>/dev/null || \
+        mv "$TMP_DIR/jdk_tmp/$inner"   "$JAVA_DIR/"
+        rm -rf "$TMP_DIR/jdk_tmp"
+    else
+        tar -xzf "$archive" -C "$JAVA_DIR" --strip-components=1
+    fi
+    rm -f "$archive"
+
+    mkdir -p "$BIN_DIR"
+    if [ "$OS" = "windows" ]; then
+        for b in java javac jar keytool; do
+            [ -f "$JAVA_DIR/bin/${b}.exe" ] && cp "$JAVA_DIR/bin/${b}.exe" "$BIN_DIR/${b}.exe"
+        done
+    else
+        for b in java javac jar keytool; do ln -sf "$JAVA_DIR/bin/$b" "$BIN_DIR/$b"; done
+    fi
+
+    add_to_path "$BIN_DIR"
+    export JAVA_HOME="$JAVA_DIR"
+    for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
+        [ -f "$rc" ] && ! grep -q "JAVA_HOME" "$rc" && \
+            echo "export JAVA_HOME=\"$JAVA_DIR\"" >> "$rc"
+    done
+
+    echo ""
+    divider
+    lsuccess "Java ${version} установлена!"
+    echo -e "  ${DIM}JAVA_HOME = $JAVA_DIR${RESET}"
+    echo -e "  ${DIM}Лог: ${LOG_FILE}${RESET}"
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  УСТАНОВКА KOTLIN
+# ══════════════════════════════════════════════════════════════════
+install_kotlin() {
+    print_banner
+    log_init "install_kotlin"
+    lstep "Установка Kotlin (последняя версия — JetBrains)"
+    divider
+
+    [ -z "$(find_java)" ] && {
+        lwarn "Java не найдена — Kotlin требует Java"
+        echo -ne "  Установить Java автоматически? [Y/n]: "
+        read -r ans
+        [[ "$ans" =~ ^[Nn]$ ]] && { lerror "Отмена"; exit 1; }
+        install_java
+    }
+
+    linfo "Запрашиваю GitHub Releases API..."
+    local meta version
+    meta=$(curl -fsSL "https://api.github.com/repos/JetBrains/kotlin/releases/latest" 2>/dev/null) || {
+        lerror "Нет соединения с GitHub API"; exit 1
+    }
+    version=$(echo "$meta" | grep '"tag_name"' | head -1 | cut -d'"' -f4 | sed 's/^v//')
+    [ -z "$version" ] && { lerror "Не удалось определить версию Kotlin"; exit 1; }
+
+    local url="https://github.com/JetBrains/kotlin/releases/download/v${version}/kotlin-compiler-${version}.zip"
+    linfo "Версия: ${BOLD}${version}${RESET}"
+
+    local archive="$TMP_DIR/kotlin.zip"
+    mkdir -p "$TMP_DIR"
+    lstep "Скачиваю Kotlin Compiler ${version}..."
+    download "$url" "$archive"
+
+    lstep "Распаковываю..."
+    rm -rf "$KOTLIN_DIR"
+    unzip -q "$archive" -d "$INSTALL_DIR"
+    mv "$INSTALL_DIR/kotlinc" "$KOTLIN_DIR"
+    rm -f "$archive"
+
+    mkdir -p "$BIN_DIR"
+    if [ "$OS" = "windows" ]; then
+        [ -f "$KOTLIN_DIR/bin/kotlinc.bat" ] && cp "$KOTLIN_DIR/bin/kotlinc.bat" "$BIN_DIR/kotlinc.bat"
+        printf '#!/usr/bin/env bash\nexec "%s/bin/kotlinc.bat" "$@"\n' "$KOTLIN_DIR" > "$BIN_DIR/kotlinc"
+        chmod +x "$BIN_DIR/kotlinc"
+    else
+        ln -sf "$KOTLIN_DIR/bin/kotlinc" "$BIN_DIR/kotlinc"
+        ln -sf "$KOTLIN_DIR/bin/kotlin"  "$BIN_DIR/kotlin"
+    fi
+    add_to_path "$BIN_DIR"
+
+    echo ""
+    divider
+    lsuccess "Kotlin ${version} установлен!"
+    echo -e "  ${DIM}Лог: ${LOG_FILE}${RESET}"
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  УСТАНОВКА GRADLE
+# ══════════════════════════════════════════════════════════════════
+install_gradle() {
+    print_banner
+    log_init "install_gradle"
+    lstep "Установка Gradle (последняя стабильная)"
+    divider
+
+    [ -z "$(find_java)" ] && {
+        lwarn "Java не найдена — Gradle требует Java"
+        echo -ne "  Установить Java? [Y/n]: "
+        read -r ans
+        [[ "$ans" =~ ^[Nn]$ ]] && { lerror "Отмена"; exit 1; }
+        install_java
+    }
+
+    linfo "Запрашиваю services.gradle.org..."
+    local version
+    version=$(curl -fsSL "https://services.gradle.org/versions/current" 2>/dev/null \
+        | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)
+    [ -z "$version" ] && { lerror "Не удалось получить версию Gradle"; exit 1; }
+
+    local url="https://services.gradle.org/distributions/gradle-${version}-bin.zip"
+    linfo "Версия: ${BOLD}${version}${RESET}"
+
+    local archive="$TMP_DIR/gradle.zip"
+    mkdir -p "$TMP_DIR"
+    lstep "Скачиваю Gradle ${version}..."
+    download "$url" "$archive"
+
+    lstep "Распаковываю..."
+    rm -rf "$GRADLE_DIR"
+    unzip -q "$archive" -d "$INSTALL_DIR"
+    mv "$INSTALL_DIR/gradle-${version}" "$GRADLE_DIR"
+    rm -f "$archive"
+
+    mkdir -p "$BIN_DIR"
+    if [ "$OS" = "windows" ]; then
+        [ -f "$GRADLE_DIR/bin/gradle.bat" ] && cp "$GRADLE_DIR/bin/gradle.bat" "$BIN_DIR/gradle.bat"
+        printf '#!/usr/bin/env bash\nexec "%s/bin/gradle.bat" "$@"\n' "$GRADLE_DIR" > "$BIN_DIR/gradle"
+        chmod +x "$BIN_DIR/gradle"
+    else
+        ln -sf "$GRADLE_DIR/bin/gradle" "$BIN_DIR/gradle"
+    fi
+    add_to_path "$BIN_DIR"
+
+    echo ""
+    divider
+    lsuccess "Gradle ${version} установлен!"
+    echo -e "  ${DIM}Проверка: gradle --version${RESET}"
+    echo -e "  ${DIM}Лог: ${LOG_FILE}${RESET}"
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  УСТАНОВКА PYTHON
+# ══════════════════════════════════════════════════════════════════
+install_python() {
+    print_banner
+    log_init "install_python"
+    lstep "Установка Python (последняя стабильная)"
+    divider
+
+    # Определяем последнюю версию через python.org API
+    linfo "Запрашиваю python.org..."
+    local version
+    version=$(curl -fsSL "https://endoflife.date/api/python.json" 2>/dev/null \
+        | grep -o '"latest":"[^"]*"' | head -1 | cut -d'"' -f4)
+    [ -z "$version" ] && version="3.12.3"  # fallback
+    linfo "Версия: ${BOLD}${version}${RESET}"
+
+    if [ "$OS" = "linux" ]; then
+        # Проверяем есть ли системный Python достаточной версии
+        if has_cmd python3; then
+            local sys_ver
+            sys_ver=$(python3 --version 2>&1 | awk '{print $2}')
+            linfo "Системный Python: $sys_ver"
+            echo -ne "  Использовать системный Python ${sys_ver}? [Y/n]: "
+            read -r ans
+            if [[ ! "$ans" =~ ^[Nn]$ ]]; then
+                local py_bin; py_bin=$(which python3)
+                mkdir -p "$PYTHON_DIR/bin"
+                ln -sf "$py_bin" "$PYTHON_DIR/bin/python3"
+                lsuccess "Python $sys_ver (системный) зарегистрирован"
+                return
+            fi
+        fi
+
+        # Устанавливаем через пакетный менеджер
+        if has_cmd apt-get; then
+            linfo "Устанавливаю через apt..."
+            sudo apt-get update -qq && sudo apt-get install -y python3 python3-pip
+            local py_bin; py_bin=$(which python3)
+            mkdir -p "$PYTHON_DIR/bin"
+            ln -sf "$py_bin" "$PYTHON_DIR/bin/python3"
+        elif has_cmd dnf; then
+            sudo dnf install -y python3 python3-pip
+            mkdir -p "$PYTHON_DIR/bin"
+            ln -sf "$(which python3)" "$PYTHON_DIR/bin/python3"
+        elif has_cmd pacman; then
+            sudo pacman -S --noconfirm python python-pip
+            mkdir -p "$PYTHON_DIR/bin"
+            ln -sf "$(which python3)" "$PYTHON_DIR/bin/python3"
+        else
+            # Скачиваем portable Python через pyenv
+            linfo "Устанавливаю через pyenv..."
+            if [ ! -d "$HOME/.pyenv" ]; then
+                curl -fsSL https://pyenv.run | bash
+            fi
+            export PYENV_ROOT="$HOME/.pyenv"
+            export PATH="$PYENV_ROOT/bin:$PATH"
+            eval "$(pyenv init -)"
+            pyenv install -s "$version"
+            pyenv global "$version"
+            mkdir -p "$PYTHON_DIR/bin"
+            ln -sf "$(pyenv which python3)" "$PYTHON_DIR/bin/python3"
+        fi
+
+    elif [ "$OS" = "windows" ]; then
+        # Windows — скачиваем embeddable python
+        local arch="amd64"
+        local py_short="${version%.*}"
+        local url="https://www.python.org/ftp/python/${version}/python-${version}-embed-amd64.zip"
+        local archive="$TMP_DIR/python.zip"
+        mkdir -p "$TMP_DIR"
+        lstep "Скачиваю Python ${version} (embeddable)..."
+        download "$url" "$archive"
+        lstep "Распаковываю..."
+        rm -rf "$PYTHON_DIR"; mkdir -p "$PYTHON_DIR"
+        unzip -q "$archive" -d "$PYTHON_DIR"
+        rm -f "$archive"
+        mkdir -p "$BIN_DIR"
+        cp "$PYTHON_DIR/python.exe" "$BIN_DIR/python3.exe" 2>/dev/null || true
+
+    elif [ "$OS" = "mac" ]; then
+        if has_cmd brew; then
+            brew install python3
+            mkdir -p "$PYTHON_DIR/bin"
+            ln -sf "$(which python3)" "$PYTHON_DIR/bin/python3"
+        else
+            lwarn "Установи Homebrew для macOS: brew install python3"
+        fi
+    fi
+
+    add_to_path "$BIN_DIR"
+
+    echo ""
+    divider
+    lsuccess "Python установлен!"
+    [ -f "$PYTHON_DIR/bin/python3" ] && \
+        echo -e "  ${DIM}Версия: $("$PYTHON_DIR/bin/python3" --version 2>&1)${RESET}"
+    echo -e "  ${DIM}Лог: ${LOG_FILE}${RESET}"
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  УСТАНОВКА NODE.JS
+# ══════════════════════════════════════════════════════════════════
+install_node() {
+    print_banner
+    log_init "install_node"
+    lstep "Установка Node.js (LTS)"
+    divider
+
+    linfo "Запрашиваю nodejs.org..."
+    local meta version
+    meta=$(curl -fsSL "https://nodejs.org/dist/index.json" 2>/dev/null)
+    # Берём последнюю LTS
+    version=$(echo "$meta" | grep -o '"version":"[^"]*","date":"[^"]*","files":[^,]*,"npm":"[^"]*","v8":"[^"]*","uv":"[^"]*","zlib":"[^"]*","openssl":"[^"]*","modules":"[^"]*","lts":"[^"]*"' \
+        | grep '"lts":"[^f]' | head -1 | grep -o '"version":"[^"]*"' | cut -d'"' -f4 | sed 's/^v//')
+    # fallback простым способом
+    [ -z "$version" ] && version=$(echo "$meta" | python3 -c \
+        "import sys,json; d=json.load(sys.stdin); \
+         lts=[x for x in d if x.get('lts') and x.get('lts')!=False]; \
+         print(lts[0]['version'].lstrip('v')) if lts else print('20.11.0')" 2>/dev/null || echo "20.11.0")
+
+    linfo "Версия: ${BOLD}${version}${RESET}"
+
+    local arch_str platform
+    case "$(uname -m)" in
+        x86_64|amd64)  arch_str="x64"   ;;
+        aarch64|arm64) arch_str="arm64" ;;
+        *)             arch_str="x64"   ;;
+    esac
+
+    local url ext
+    case "$OS" in
+        linux)
+            ext="tar.xz"
+            url="https://nodejs.org/dist/v${version}/node-v${version}-linux-${arch_str}.${ext}"
+            ;;
+        mac)
+            ext="tar.gz"
+            url="https://nodejs.org/dist/v${version}/node-v${version}-darwin-${arch_str}.${ext}"
+            ;;
+        windows)
+            ext="zip"
+            url="https://nodejs.org/dist/v${version}/node-v${version}-win-${arch_str}.${ext}"
+            ;;
+    esac
+
+    local archive="$TMP_DIR/node.${ext}"
+    mkdir -p "$TMP_DIR"
+    lstep "Скачиваю Node.js ${version}..."
+    download "$url" "$archive"
+
+    lstep "Распаковываю..."
+    rm -rf "$NODE_DIR"; mkdir -p "$NODE_DIR"
+    if [ "$ext" = "zip" ]; then
+        unzip -q "$archive" -d "$TMP_DIR/node_tmp"
+        local inner; inner=$(ls "$TMP_DIR/node_tmp" | head -1)
+        mv "$TMP_DIR/node_tmp/$inner"/* "$NODE_DIR/"
+        rm -rf "$TMP_DIR/node_tmp"
+    elif [ "$ext" = "tar.xz" ]; then
+        tar -xJf "$archive" -C "$NODE_DIR" --strip-components=1
+    else
+        tar -xzf "$archive" -C "$NODE_DIR" --strip-components=1
+    fi
+    rm -f "$archive"
+
+    mkdir -p "$BIN_DIR"
+    if [ "$OS" = "windows" ]; then
+        [ -f "$NODE_DIR/node.exe" ] && cp "$NODE_DIR/node.exe" "$BIN_DIR/node.exe"
+        [ -f "$NODE_DIR/npm.cmd" ]  && cp "$NODE_DIR/npm.cmd"  "$BIN_DIR/npm.cmd"
+    else
+        ln -sf "$NODE_DIR/bin/node" "$BIN_DIR/node"
+        ln -sf "$NODE_DIR/bin/npm"  "$BIN_DIR/npm"
+        [ -f "$NODE_DIR/bin/npx" ] && ln -sf "$NODE_DIR/bin/npx" "$BIN_DIR/npx"
+    fi
+    add_to_path "$BIN_DIR"
+
+    echo ""
+    divider
+    lsuccess "Node.js ${version} установлен!"
+    echo -e "  ${DIM}node --version && npm --version${RESET}"
+    echo -e "  ${DIM}Лог: ${LOG_FILE}${RESET}"
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  ЗАГРУЗКА ИНСТРУМЕНТОВ APK
+# ══════════════════════════════════════════════════════════════════
+ensure_apk_tools() {
+    local force="${1:-}"
+    local need=false
+    [ ! -f "$TOOLS_DIR/r8.jar"      ] && need=true
+    [ ! -f "$TOOLS_DIR/android.jar" ] && need=true
+    [ ! -f "$TOOLS_DIR/apksig.jar"  ] && need=true
+    [ -n "$force" ] && need=true
+    [ "$need" = false ] && return 0
+
+    step "Загружаю инструменты сборки APK..."
+    mkdir -p "$TOOLS_DIR"
+
+    if [ ! -f "$TOOLS_DIR/r8.jar" ] || [ -n "$force" ]; then
+        info "R8/D8 DEX Compiler (Google Maven)..."
+        download "$D8_URL" "$TOOLS_DIR/r8.jar" 2>/dev/null || \
+        download "$D8_FB"  "$TOOLS_DIR/r8.jar" || { error "Не удалось скачать r8.jar"; exit 1; }
+        success "  r8.jar ($(du -sh "$TOOLS_DIR/r8.jar" | cut -f1))"
+    fi
+
+    if [ ! -f "$TOOLS_DIR/android.jar" ] || [ -n "$force" ]; then
+        info "Android API stubs (android.jar)..."
+        download "$ANDROID_JAR_URL"  "$TOOLS_DIR/android.jar" 2>/dev/null || \
+        download "$ANDROID_JAR_FB1"  "$TOOLS_DIR/android.jar" 2>/dev/null || \
+        download "$ANDROID_JAR_FB2"  "$TOOLS_DIR/android.jar" || { error "Не удалось скачать android.jar"; exit 1; }
+        success "  android.jar ($(du -sh "$TOOLS_DIR/android.jar" | cut -f1))"
+    fi
+
+    if [ ! -f "$TOOLS_DIR/apksig.jar" ] || [ -n "$force" ]; then
+        info "APK Signer (apksig, Google Maven)..."
+        download "$APKSIG_URL" "$TOOLS_DIR/apksig.jar" 2>/dev/null || \
+        download "$APKSIG_FB"  "$TOOLS_DIR/apksig.jar" 2>/dev/null || \
+            warn "  apksig не скачался — APK без подписи"
+        [ -f "$TOOLS_DIR/apksig.jar" ] && \
+            success "  apksig.jar ($(du -sh "$TOOLS_DIR/apksig.jar" | cut -f1))"
+    fi
+
+    # Генерируем debug keystore
+    if [ ! -f "$TOOLS_DIR/tux-debug.keystore" ]; then
+        local kt="$JAVA_DIR/bin/keytool${EXE_EXT}"
+        has_cmd keytool && kt="keytool"
+        if [ -f "$kt" ] || has_cmd keytool; then
+            info "Генерирую debug keystore..."
+            "$kt" -genkeypair \
+                -keystore "$TOOLS_DIR/tux-debug.keystore" \
+                -alias tuxdebug -keyalg RSA -keysize 2048 -validity 9999 \
+                -storepass tuxdebug -keypass tuxdebug \
+                -dname "CN=TuxDebug,O=Tux,C=US" 2>/dev/null && \
+                success "  tux-debug.keystore создан" || warn "  Keystore не создан"
+        fi
+    fi
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  УПАКОВКА APK В ZIP
+# ══════════════════════════════════════════════════════════════════
+pack_apk_zip() {
+    local apk_dir="$1" output="$2"
+    # Перечень файлов для упаковки
+    local files=()
+    [ -f "$apk_dir/classes.dex"         ] && files+=("classes.dex")
+    [ -f "$apk_dir/AndroidManifest.xml" ] && files+=("AndroidManifest.xml")
+    [ -d "$apk_dir/res"                 ] && files+=("res")
+
+    cd "$apk_dir"
+    if has_cmd zip; then
+        zip -qr "$output" "${files[@]}"
+    elif [ "$OS" = "windows" ] && has_cmd powershell; then
+        local win_out="${output//\//\\}"
+        powershell -NoProfile -Command "
+            Add-Type -Assembly 'System.IO.Compression.FileSystem'
+            \$z = [IO.Compression.ZipFile]::Open('${win_out}','Create')
+            foreach (\$f in @($(printf "'%s'," "${files[@]}"))) {
+                [IO.Compression.ZipFileExtensions]::CreateEntryFromFile(\$z,\$f,\$f) | Out-Null
+            }
+            \$z.Dispose()
+        " || { error "PowerShell zip failed"; cd - >/dev/null; exit 1; }
+    elif has_cmd python3; then
+        python3 -c "
+import zipfile, os, sys
+files = sys.argv[1:]
+with zipfile.ZipFile('${output}','w',zipfile.ZIP_DEFLATED) as z:
+    for f in files:
+        if os.path.isdir(f):
+            for root,dirs,fs in os.walk(f):
+                for ff in fs: z.write(os.path.join(root,ff))
+        else:
+            z.write(f)
+" "${files[@]}"
+    else
+        error "Нужен zip, PowerShell или python3"; cd - >/dev/null; exit 1
+    fi
+    cd - >/dev/null
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  ГЕНЕРАЦИЯ AndroidManifest.xml
+# ══════════════════════════════════════════════════════════════════
+gen_manifest() {
+    local dest="$1" pkg="$2" app_name="$3" main_activity="${4:-MainActivity}"
+    cat > "$dest" << MANIFEST
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="${pkg}" android:versionCode="1" android:versionName="1.0">
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="34"/>
+    <application android:label="${app_name}" android:allowBackup="true">
+        <activity android:name=".${main_activity}" android:exported="true"
+            android:configChanges="orientation|screenSize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
+MANIFEST
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  SIGN APK
+# ══════════════════════════════════════════════════════════════════
+sign_apk() {
+    local java_bin="$1" unsigned="$2" output="$3" keystore="$4" alias="$5" storepass="$6" keypass="$7"
+
+    set +e
+    "$java_bin" -jar "$TOOLS_DIR/apksig.jar" sign \
+        --ks "$keystore" --ks-pass "pass:$storepass" \
+        --ks-key-alias "$alias" --key-pass "pass:$keypass" \
+        --in "$unsigned" --out "$output" 2>&1 | \
+        while IFS= read -r l; do
+            echo -e "    ${DIM}${l}${RESET}"
+            [ -n "$LOG_FILE" ] && log_line "$l"
+        done
+    local rc=${PIPESTATUS[0]}
+    set -e
+    return $rc
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  СБОРКА APK (debug / release)
+# ══════════════════════════════════════════════════════════════════
+install_apk() {
+    local raw_files="$1"
+    local mode="${2:-debug}"   # debug | release
+    print_banner
+    log_init "build_apk_${mode}"
+    lstep "Сборка APK [${mode}] — автономный режим"
+    divider
+
+    [ -z "$raw_files" ] && { lerror "Файлы не указаны"; exit 1; }
+    IFS='+' read -ra FILES <<< "$raw_files"
+
+    lstep "Проверяю исходные файлы..."
+    local all_ok=true
+    for i in "${!FILES[@]}"; do
+        FILES[$i]="$(echo "${FILES[$i]}" | xargs)"
+        if [ -f "${FILES[$i]}" ]; then lsuccess "  ${FILES[$i]}"
+        else lerror "  ${FILES[$i]} — не найден"; all_ok=false; fi
+    done
+    $all_ok || { lerror "Исправь пути к файлам"; exit 1; }
+
+    lstep "Проверяю окружение..."
+    local java_bin; java_bin="$(find_java)"
+    [ -z "$java_bin" ] && { lerror "Java не установлена: tux install java"; exit 1; }
+    lsuccess "  Java: $($java_bin -version 2>&1 | head -1)"
+
+    local kotlinc_bin; kotlinc_bin="$(find_kotlinc)"
+    [ -z "$kotlinc_bin" ] && { lerror "Kotlin не установлен: tux install kotlin"; exit 1; }
+    lsuccess "  Kotlin: $($kotlinc_bin -version 2>&1 | head -1)"
+
+    ensure_apk_tools
+
+    local project_name
+    project_name="$(basename "${FILES[0]}" .kt | sed 's/[^a-zA-Z0-9_]//g')"
+    local pkg_name="com.tux.$(echo "$project_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g')"
+    local build_dir="$TMP_DIR/${project_name}_$$"
+    local output_apk="$(pwd)/${project_name}-${mode}.apk"
+
+    rm -rf "$build_dir"
+    mkdir -p "$build_dir/src" "$build_dir/dex" "$build_dir/apk"
+    for f in "${FILES[@]}"; do cp "$f" "$build_dir/src/"; done
+
+    linfo "Проект: ${BOLD}${project_name}${RESET}"
+    linfo "Режим:  ${BOLD}${mode}${RESET}"
+
+    # ── Шаг 1: Kotlin → JAR ───────────────────────────────────
+    lstep "Шаг 1/5 — Kotlin → JAR..."
+    local kt_files=()
+    for f in "${FILES[@]}"; do kt_files+=("$build_dir/src/$(basename "$f")"); done
+
+    set +e
+    "$kotlinc_bin" -classpath "$TOOLS_DIR/android.jar" \
+        "${kt_files[@]}" -include-runtime -d "$build_dir/app.jar" 2>&1 | \
+        while IFS= read -r l; do
+            echo -e "    ${DIM}${l}${RESET}"
+            [ -n "$LOG_FILE" ] && log_line "$l"
+        done
+    local kc_rc=${PIPESTATUS[0]}
+    set -e
+    [ $kc_rc -ne 0 ] && { lerror "Ошибка компиляции Kotlin"; rm -rf "$build_dir"; exit 1; }
+    lsuccess "  → app.jar ($(du -sh "$build_dir/app.jar" | cut -f1))"
+
+    # ── Шаг 2: JAR → DEX ──────────────────────────────────────
+    lstep "Шаг 2/5 — JAR → Android DEX (R8/D8)..."
+    local d8_args=(
+        -cp "$TOOLS_DIR/r8.jar" com.android.tools.r8.D8
+        --min-api 21
+        --lib "$TOOLS_DIR/android.jar"
+        --output "$build_dir/dex/"
+    )
+    [ "$mode" = "release" ] && d8_args+=(--release)
+
+    set +e
+    "$java_bin" "${d8_args[@]}" "$build_dir/app.jar" 2>&1 | \
+        while IFS= read -r l; do
+            echo -e "    ${DIM}${l}${RESET}"
+            [ -n "$LOG_FILE" ] && log_line "$l"
+        done
+    local d8_rc=${PIPESTATUS[0]}
+    set -e
+
+    if [ $d8_rc -ne 0 ] || [ ! -f "$build_dir/dex/classes.dex" ]; then
+        lwarn "  Пробую без --release..."
+        "$java_bin" -cp "$TOOLS_DIR/r8.jar" com.android.tools.r8.D8 \
+            --min-api 21 --lib "$TOOLS_DIR/android.jar" \
+            --output "$build_dir/dex/" "$build_dir/app.jar" || \
+            { lerror "DEX конвертация провалилась"; rm -rf "$build_dir"; exit 1; }
+    fi
+    lsuccess "  → classes.dex ($(du -sh "$build_dir/dex/classes.dex" | cut -f1))"
+
+    # ── Шаг 3: Манифест ───────────────────────────────────────
+    lstep "Шаг 3/5 — Генерирую AndroidManifest.xml..."
+    local main_activity="MainActivity"
+    for f in "${FILES[@]}"; do
+        if grep -qE "class .+(Activity|Fragment)|fun main\b" "$f" 2>/dev/null; then
+            local found; found=$(grep -oE 'class [A-Za-z]+' "$f" | head -1 | awk '{print $2}')
+            [ -n "$found" ] && main_activity="$found" && break
+        fi
+    done
+    cp "$build_dir/dex/classes.dex" "$build_dir/apk/"
+    gen_manifest "$build_dir/apk/AndroidManifest.xml" "$pkg_name" "$project_name" "$main_activity"
+    lsuccess "  → AndroidManifest.xml (pkg: ${pkg_name})"
+
+    # ── Шаг 4: Упаковка ZIP ───────────────────────────────────
+    lstep "Шаг 4/5 — Упаковываю APK..."
+    local unsigned="$build_dir/${project_name}-unsigned.apk"
+    pack_apk_zip "$build_dir/apk" "$unsigned"
+    lsuccess "  → unsigned APK"
+
+    # ── Шаг 5: Подпись ────────────────────────────────────────
+    lstep "Шаг 5/5 — Подписываю APK (${mode})..."
+
+    local keystore alias storepass keypass
+    if [ "$mode" = "release" ]; then
+        echo ""
+        echo -e "  ${BOLD}Параметры release-подписи:${RESET}"
+        echo -ne "  Путь к keystore [Enter = создать новый]: "
+        read -r ks_path
+        if [ -z "$ks_path" ]; then
+            # Создаём release keystore
+            local rel_ks="$(pwd)/${project_name}-release.keystore"
+            echo -ne "  Псевдоним ключа (alias) [${project_name}]: "; read -r ks_alias
+            echo -ne "  Пароль keystore: "; read -rs ks_pass; echo ""
+            ks_alias="${ks_alias:-$project_name}"
+            echo -ne "  Имя (CN) [My App]: "; read -r ks_cn; ks_cn="${ks_cn:-My App}"
+            "$java_bin" -jar "$JAVA_DIR/lib/tools.jar" 2>/dev/null || true
+            "$JAVA_DIR/bin/keytool${EXE_EXT}" \
+                -genkeypair -keystore "$rel_ks" \
+                -alias "$ks_alias" -keyalg RSA -keysize 2048 -validity 9999 \
+                -storepass "$ks_pass" -keypass "$ks_pass" \
+                -dname "CN=${ks_cn},O=MyOrg,C=US" 2>/dev/null && \
+                lsuccess "  Release keystore создан: $rel_ks"
+            keystore="$rel_ks"; alias="$ks_alias"; storepass="$ks_pass"; keypass="$ks_pass"
+        else
+            keystore="$ks_path"
+            echo -ne "  Alias: "; read -r alias
+            echo -ne "  Store password: "; read -rs storepass; echo ""
+            keypass="$storepass"
+        fi
+    else
+        # Debug подпись
+        keystore="$TOOLS_DIR/tux-debug.keystore"
+        alias="tuxdebug"; storepass="tuxdebug"; keypass="tuxdebug"
+    fi
+
+    if [ -f "$TOOLS_DIR/apksig.jar" ] && [ -f "$keystore" ]; then
+        if sign_apk "$java_bin" "$unsigned" "$output_apk" "$keystore" "$alias" "$storepass" "$keypass"; then
+            lsuccess "  APK подписан (v2 signature) ✓"
+        else
+            lwarn "  Подпись не удалась — копирую без подписи"
+            cp "$unsigned" "$output_apk"
+        fi
+    else
+        lwarn "  Подпись пропущена"
+        cp "$unsigned" "$output_apk"
+    fi
+
+    rm -rf "$build_dir"
+    log_line "OUTPUT: $output_apk"
+
+    echo ""
+    divider
+    echo -e "\n  ${GREEN}${BOLD}✓ APK [${mode}] собран!${RESET}\n"
+    echo -e "  ${BOLD}Файл:${RESET}   ${CYAN}${output_apk}${RESET}"
+    echo -e "  ${BOLD}Размер:${RESET} $(du -sh "$output_apk" 2>/dev/null | cut -f1)"
+    echo -e "  ${BOLD}Пакет:${RESET}  ${DIM}${pkg_name}${RESET}"
+    echo -e "  ${BOLD}Лог:${RESET}    ${DIM}${LOG_FILE}${RESET}"
+    echo ""
+    echo -e "  ${BOLD}Установка:${RESET}  ${CYAN}adb install $(basename "$output_apk")${RESET}"
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  СБОРКА AAB (Android App Bundle)
+#  AAB = ZIP с особой структурой для Google Play
+# ══════════════════════════════════════════════════════════════════
+build_aab() {
+    local raw_files="$1"
+    print_banner
+    log_init "build_aab"
+    lstep "Сборка AAB (Android App Bundle для Google Play)"
+    divider
+
+    [ -z "$raw_files" ] && { lerror "Файлы не указаны"; exit 1; }
+    IFS='+' read -ra FILES <<< "$raw_files"
+
+    lstep "Проверяю файлы..."
+    local all_ok=true
+    for i in "${!FILES[@]}"; do
+        FILES[$i]="$(echo "${FILES[$i]}" | xargs)"
+        [ -f "${FILES[$i]}" ] && lsuccess "  ${FILES[$i]}" || { lerror "  ${FILES[$i]} — не найден"; all_ok=false; }
+    done
+    $all_ok || exit 1
+
+    local java_bin; java_bin="$(find_java)"
+    [ -z "$java_bin" ] && { lerror "Java не установлена: tux install java"; exit 1; }
+    local kotlinc_bin; kotlinc_bin="$(find_kotlinc)"
+    [ -z "$kotlinc_bin" ] && { lerror "Kotlin не установлен: tux install kotlin"; exit 1; }
+
+    ensure_apk_tools
+
+    local project_name
+    project_name="$(basename "${FILES[0]}" .kt | sed 's/[^a-zA-Z0-9_]//g')"
+    local pkg_name="com.tux.$(echo "$project_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g')"
+    local build_dir="$TMP_DIR/${project_name}_aab_$$"
+    local output_aab="$(pwd)/${project_name}.aab"
+
+    rm -rf "$build_dir"
+    # Структура AAB: base/dex/  base/manifest/  base/res/  base/root/
+    mkdir -p \
+        "$build_dir/src" \
+        "$build_dir/aab/base/dex" \
+        "$build_dir/aab/base/manifest" \
+        "$build_dir/aab/base/res/layout" \
+        "$build_dir/aab/base/root"
+
+    for f in "${FILES[@]}"; do cp "$f" "$build_dir/src/"; done
+
+    # ── Шаг 1: Kotlin → JAR ──────────────────────────────────
+    lstep "Шаг 1/4 — Kotlin → JAR..."
+    local kt_files=()
+    for f in "${FILES[@]}"; do kt_files+=("$build_dir/src/$(basename "$f")"); done
+    set +e
+    "$kotlinc_bin" -classpath "$TOOLS_DIR/android.jar" \
+        "${kt_files[@]}" -include-runtime -d "$build_dir/app.jar" 2>&1 | \
+        while IFS= read -r l; do echo -e "    ${DIM}${l}${RESET}"; [ -n "$LOG_FILE" ] && log_line "$l"; done
+    local kc_rc=${PIPESTATUS[0]}
+    set -e
+    [ $kc_rc -ne 0 ] && { lerror "Ошибка компиляции"; rm -rf "$build_dir"; exit 1; }
+    lsuccess "  → app.jar"
+
+    # ── Шаг 2: JAR → DEX ─────────────────────────────────────
+    lstep "Шаг 2/4 — JAR → DEX (R8)..."
+    "$java_bin" -cp "$TOOLS_DIR/r8.jar" com.android.tools.r8.D8 \
+        --release --min-api 21 \
+        --lib "$TOOLS_DIR/android.jar" \
+        --output "$build_dir/aab/base/dex/" \
+        "$build_dir/app.jar" 2>/dev/null || \
+    "$java_bin" -cp "$TOOLS_DIR/r8.jar" com.android.tools.r8.D8 \
+        --min-api 21 --lib "$TOOLS_DIR/android.jar" \
+        --output "$build_dir/aab/base/dex/" "$build_dir/app.jar" || \
+        { lerror "DEX ошибка"; rm -rf "$build_dir"; exit 1; }
+    lsuccess "  → classes.dex"
+
+    # ── Шаг 3: Манифест + метаданные AAB ─────────────────────
+    lstep "Шаг 3/4 — Создаю структуру AAB..."
+    local main_activity="MainActivity"
+    for f in "${FILES[@]}"; do
+        if grep -qE "class .+(Activity)" "$f" 2>/dev/null; then
+            local found; found=$(grep -oE 'class [A-Za-z]+' "$f" | head -1 | awk '{print $2}')
+            [ -n "$found" ] && main_activity="$found" && break
+        fi
+    done
+
+    gen_manifest "$build_dir/aab/base/manifest/AndroidManifest.xml" \
+        "$pkg_name" "$project_name" "$main_activity"
+
+    # BundleConfig.pb заглушка (protobuf, минимальная)
+    # Создаём текстовую версию (bundletool может читать)
+    cat > "$build_dir/aab/BundleConfig.json" << BCFG
+{
+    "bundletool": {"version": "1.15.0"},
+    "optimizations": {
+        "splitsConfig": {
+            "splitDimension": [
+                {"value": "ABI",      "negate": false, "suffixStripping": {"enabled": true}},
+                {"value": "SCREEN_DENSITY", "negate": false, "suffixStripping": {"enabled": true}},
+                {"value": "LANGUAGE", "negate": true}
+            ]
+        }
+    }
+}
+BCFG
+
+    # Минимальный resources.pb (бинарный proto — пустой)
+    printf '\x0a\x00' > "$build_dir/aab/base/resources.pb"
+
+    lsuccess "  → base/manifest/AndroidManifest.xml"
+    lsuccess "  → BundleConfig.json"
+
+    # ── Шаг 4: Упаковка AAB (ZIP) ────────────────────────────
+    lstep "Шаг 4/4 — Упаковываю AAB..."
+    cd "$build_dir/aab"
+    local unsigned_aab="$build_dir/${project_name}-unsigned.aab"
+
+    if has_cmd zip; then
+        zip -qr "$unsigned_aab" base/ BundleConfig.json
+    elif has_cmd python3; then
+        python3 -c "
+import zipfile, os
+with zipfile.ZipFile('${unsigned_aab}','w',zipfile.ZIP_DEFLATED) as z:
+    for root,dirs,files in os.walk('base'):
+        for f in files: z.write(os.path.join(root,f))
+    z.write('BundleConfig.json')
+"
+    else
+        error "Нужен zip или python3"; cd - >/dev/null; exit 1
+    fi
+    cd - >/dev/null
+
+    # Подпись AAB
+    if [ -f "$TOOLS_DIR/apksig.jar" ] && [ -f "$TOOLS_DIR/tux-debug.keystore" ]; then
+        sign_apk "$java_bin" "$unsigned_aab" "$output_aab" \
+            "$TOOLS_DIR/tux-debug.keystore" "tuxdebug" "tuxdebug" "tuxdebug" && \
+            lsuccess "  AAB подписан" || { lwarn "  Подпись AAB не удалась"; cp "$unsigned_aab" "$output_aab"; }
+    else
+        cp "$unsigned_aab" "$output_aab"
+    fi
+
+    rm -rf "$build_dir"
+    log_line "OUTPUT: $output_aab"
+
+    echo ""
+    divider
+    echo -e "\n  ${GREEN}${BOLD}✓ AAB собран!${RESET}\n"
+    echo -e "  ${BOLD}Файл:${RESET}   ${CYAN}${output_aab}${RESET}"
+    echo -e "  ${BOLD}Размер:${RESET} $(du -sh "$output_aab" 2>/dev/null | cut -f1)"
+    echo -e "  ${BOLD}Пакет:${RESET}  ${DIM}${pkg_name}${RESET}"
+    echo -e "  ${BOLD}Лог:${RESET}    ${DIM}${LOG_FILE}${RESET}"
+    echo ""
+    echo -e "  ${BOLD}Загрузка в Google Play:${RESET}"
+    echo -e "  ${DIM}  play.google.com/console → Выпуск → Загрузить AAB${RESET}"
+    echo ""
+    echo -e "  ${BOLD}Тест локально (bundletool):${RESET}"
+    echo -e "  ${CYAN}  bundletool build-apks --bundle=$(basename "$output_aab") --output=app.apks${RESET}"
+    echo -e "  ${CYAN}  bundletool install-apks --apks=app.apks${RESET}"
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  ОБНОВЛЕНИЕ ИНСТРУМЕНТОВ
+# ══════════════════════════════════════════════════════════════════
+update_tools() {
+    print_banner
+    step "Обновление инструментов сборки APK..."
+    ensure_apk_tools "force"
+    success "Готово!"
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  СПРАВКА
+# ══════════════════════════════════════════════════════════════════
+show_help() {
+    print_banner
+    echo -e "  ${BOLD}Установка языков:${RESET}"
+    echo -e "    ${CYAN}tux install java${RESET}    ${DIM}Adoptium Temurin LTS${RESET}"
+    echo -e "    ${CYAN}tux install kotlin${RESET}  ${DIM}JetBrains (последняя)${RESET}"
+    echo -e "    ${CYAN}tux install gradle${RESET}  ${DIM}последняя стабильная${RESET}"
+    echo -e "    ${CYAN}tux install python${RESET}  ${DIM}последняя стабильная${RESET}"
+    echo -e "    ${CYAN}tux install node${RESET}    ${DIM}Node.js LTS${RESET}"
+    echo ""
+    echo -e "  ${BOLD}Сборка:${RESET}"
+    echo -e "    ${CYAN}tux install apk Main.kt${RESET}              ${DIM}APK debug${RESET}"
+    echo -e "    ${CYAN}tux install apk Main.kt+B.kt release${RESET} ${DIM}APK release${RESET}"
+    echo -e "    ${CYAN}tux build aab Main.kt${RESET}                ${DIM}Android App Bundle${RESET}"
+    echo ""
+    echo -e "  ${BOLD}Прочее:${RESET}"
+    echo -e "    ${CYAN}tux self-install${RESET} ${DIM}добавить tux в терминал навсегда${RESET}"
+    echo -e "    ${CYAN}tux list${RESET}         ${DIM}таблица установленного${RESET}"
+    echo -e "    ${CYAN}tux logs${RESET}         ${DIM}просмотр логов сборки${RESET}"
+    echo -e "    ${CYAN}tux update-tools${RESET} ${DIM}обновить R8/apksig/android.jar${RESET}"
+    echo -e "    ${CYAN}tux version${RESET}      ${DIM}версии компонентов${RESET}"
+    echo ""
+    divider
+    echo -e "  ${DIM}Запусти просто ${CYAN}tux${RESET}${DIM} для интерактивного меню (↑↓ + Enter)${RESET}"
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  SELF-INSTALL — добавляет tux в PATH навсегда
+# ══════════════════════════════════════════════════════════════════
+self_install() {
+    print_banner
+    step "Установка Tux в систему"
+    divider
+
+    local SCRIPT_PATH
+    # Получаем абсолютный путь к самому себе
+    SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+    # Определяем куда установить
+    local install_dir needs_sudo=false
+    if [ -d "/usr/local/bin" ] && [ -w "/usr/local/bin" ]; then
+        install_dir="/usr/local/bin"
+    elif [ -d "/usr/local/bin" ]; then
+        install_dir="/usr/local/bin"
+        needs_sudo=true
+    else
+        install_dir="$HOME/.local/bin"
+        mkdir -p "$install_dir"
+    fi
+
+    info "Устанавливаю в: ${BOLD}${install_dir}/tux${RESET}"
+
+    # Копируем себя в install_dir (если уже не там)
+    if [ "$SCRIPT_PATH" != "$install_dir/tux" ]; then
+        if [ "$needs_sudo" = true ]; then
+            sudo cp "$SCRIPT_PATH" "$install_dir/tux"
+            sudo chmod +x "$install_dir/tux"
+        else
+            cp "$SCRIPT_PATH" "$install_dir/tux"
+            chmod +x "$install_dir/tux"
+        fi
+        success "tux скопирован в $install_dir/tux"
+    else
+        info "tux уже находится в $install_dir"
+    fi
+
+    # Добавляем в PATH если нужно
+    local needs_path=false
+    echo "$PATH" | grep -q "$install_dir" || needs_path=true
+
+    if [ "$needs_path" = true ]; then
+        info "Добавляю $install_dir в PATH..."
+        local export_line="export PATH=\"${install_dir}:\$PATH\""
+        local added=false
+        for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.bash_profile" "$HOME/.profile"; do
+            if [ -f "$rc" ] && ! grep -qF "$install_dir" "$rc"; then
+                { echo ""; echo "# Added by Tux"; echo "$export_line"; } >> "$rc"
+                success "  Добавлено в $(basename "$rc")"
+                added=true
+            fi
+        done
+        # Если нет ни одного rc — создаём .bashrc
+        if [ "$added" = false ] && [ ! -f "$HOME/.bashrc" ]; then
+            echo "$export_line" > "$HOME/.bashrc"
+            success "  Создан ~/.bashrc"
+        fi
+        export PATH="$install_dir:$PATH"
+    fi
+
+    echo ""
+    divider
+    echo -e "\n  ${GREEN}${BOLD}✓ Tux установлен!${RESET}\n"
+
+    if [ "$needs_path" = true ] && [ "$install_dir" = "$HOME/.local/bin" ]; then
+        echo -e "  ${YELLOW}Перезапусти терминал или выполни:${RESET}"
+        echo -e "    ${CYAN}source ~/.bashrc${RESET}"
+        echo ""
+        echo -e "  После этого просто пиши ${BOLD}tux${RESET} в любом терминале"
+    else
+        echo -e "  Теперь просто пиши ${BOLD}tux${RESET} в любом терминале — как python или git"
+    fi
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  ВЕРСИИ
+# ══════════════════════════════════════════════════════════════════
+show_version() { show_list; }
+
+# ══════════════════════════════════════════════════════════════════
+#  ТОЧКА ВХОДА
+# ══════════════════════════════════════════════════════════════════
+main() {
+    case "${1:-}" in
+        install)
+            case "${2:-}" in
+                java)    install_java ;;
+                kotlin)  install_kotlin ;;
+                gradle)  install_gradle ;;
+                python)  install_python ;;
+                node)    install_node ;;
+                apk)
+                    [ -z "${3:-}" ] && { error "tux install apk Main.kt+B.kt [release]"; exit 1; }
+                    install_apk "$3" "${4:-debug}"
+                    ;;
+                "")  error "Укажи пакет: java kotlin gradle python node apk"; exit 1 ;;
+                *)   error "Неизвестный пакет: '${2}'"; exit 1 ;;
+            esac ;;
+        build)
+            case "${2:-}" in
+                aab)
+                    [ -z "${3:-}" ] && { error "tux build aab Main.kt+B.kt"; exit 1; }
+                    build_aab "$3"
+                    ;;
+                *)  error "tux build aab <файлы>"; exit 1 ;;
+            esac ;;
+        list)              show_list ;;
+        logs)              show_logs ;;
+        update-tools)      update_tools ;;
+        self-install)      self_install ;;
+        version|--version) show_version ;;
+        help|--help|-h)    show_help ;;
+        "")                interactive_menu ;;  # Главное меню без аргументов!
+        *)
+            error "Неизвестная команда: '${1}'"
+            echo -e "  ${DIM}tux help${RESET}"
+            exit 1 ;;
+    esac
+}
+
+main "$@"
