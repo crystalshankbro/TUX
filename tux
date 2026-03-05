@@ -1,0 +1,1594 @@
+#!/usr/bin/env bash
+
+# ═══════════════════════════════════════════════════════════════════
+#   TUX — Package Manager & APK/AAB Builder  v3.0
+#   Platforms: Linux · Windows (Git Bash/MSYS2/WSL) · macOS
+#
+#   New in v3.0:
+#     • Interactive menu (just run: tux)
+#     • New languages: Gradle, Python, Node.js
+#     • AAB build (Android App Bundle for Google Play)
+#     • Release APK signing with your own key
+#     • Build logs in ~/.tux/logs/
+#     • tux list — table of all installed packages
+# ═══════════════════════════════════════════════════════════════════
+
+set -eo pipefail
+
+# ══════════════════════════════════════════════════════════════════
+#  COLORS
+# ══════════════════════════════════════════════════════════════════
+RED='\033[0;31m';    GREEN='\033[0;32m';   YELLOW='\033[1;33m'
+CYAN='\033[0;36m';   BLUE='\033[0;34m';    MAGENTA='\033[0;35m'
+WHITE='\033[1;37m';  BOLD='\033[1m';       DIM='\033[2m'
+RESET='\033[0m';     BG_BLUE='\033[44m';   BG_CYAN='\033[46m'
+REVERSE='\033[7m'
+
+# ══════════════════════════════════════════════════════════════════
+#  OS DETECTION
+# ══════════════════════════════════════════════════════════════════
+detect_os() {
+    case "$(uname -s)" in
+        Linux*)        OS="linux"   ;;
+        Darwin*)       OS="mac"     ;;
+        CYGWIN*|MINGW*|MSYS*) OS="windows" ;;
+        *)
+            grep -qi microsoft /proc/version 2>/dev/null \
+                && OS="linux" || OS="linux" ;;
+    esac
+    export OS
+}
+detect_os
+
+# ══════════════════════════════════════════════════════════════════
+#  INTERFACE LANGUAGE (ru / en)
+# ══════════════════════════════════════════════════════════════════
+TUX_LANG="${TUX_LANG:-ru}"
+
+# ══════════════════════════════════════════════════════════════════
+if [ "$OS" = "windows" ]; then
+    INSTALL_DIR="${USERPROFILE:-$HOME}/.tux"
+    TMP_DIR="${TEMP:-/tmp}/tux_build"
+    EXE_EXT=".exe"
+else
+    INSTALL_DIR="$HOME/.tux"
+    TMP_DIR="/tmp/tux_build"
+    EXE_EXT=""
+fi
+
+JAVA_DIR="$INSTALL_DIR/java"
+KOTLIN_DIR="$INSTALL_DIR/kotlin"
+GRADLE_DIR="$INSTALL_DIR/gradle"
+PYTHON_DIR="$INSTALL_DIR/python"
+NODE_DIR="$INSTALL_DIR/node"
+TOOLS_DIR="$INSTALL_DIR/tools"
+BIN_DIR="$INSTALL_DIR/bin"
+LOGS_DIR="$INSTALL_DIR/logs"
+
+# Maven Google (no SDK)
+D8_URL="https://maven.google.com/com/android/tools/build/r8/8.3.37/r8-8.3.37.jar"
+D8_FB="https://maven.google.com/com/android/tools/build/r8/3.3.75/r8-3.3.75.jar"
+APKSIG_URL="https://maven.google.com/com/android/apksig/apksig/8.3.0/apksig-8.3.0.jar"
+APKSIG_FB="https://maven.google.com/com/android/apksig/apksig/7.4.2/apksig-7.4.2.jar"
+ANDROID_JAR_URL="https://github.com/Sable/android-platforms/raw/master/android-34/android.jar"
+ANDROID_JAR_FB1="https://github.com/Sable/android-platforms/raw/master/android-33/android.jar"
+ANDROID_JAR_FB2="https://github.com/Sable/android-platforms/raw/master/android-32/android.jar"
+
+# ══════════════════════════════════════════════════════════════════
+#  HELPER FUNCTIONS
+# ══════════════════════════════════════════════════════════════════
+has_cmd() { command -v "$1" &>/dev/null; }
+
+info()    { echo -e "${CYAN}[•]${RESET} $1"; }
+success() { echo -e "${GREEN}[✓]${RESET} $1"; }
+warn()    { echo -e "${YELLOW}[!]${RESET} $1"; }
+error()   { echo -e "${RED}[✗]${RESET} $1" >&2; }
+step()    { echo -e "\n${MAGENTA}[→]${RESET} ${BOLD}$1${RESET}"; }
+divider() { echo -e "${DIM}  ──────────────────────────────────────${RESET}"; }
+
+# Logging — write to both console and file
+LOG_FILE=""
+log_init() {
+    mkdir -p "$LOGS_DIR"
+    LOG_FILE="$LOGS_DIR/$(date +%Y%m%d_%H%M%S)_${1}.log"
+    echo "=== TUX LOG: $1  $(date) ===" > "$LOG_FILE"
+    echo "OS: $OS  |  Tux v3.0" >> "$LOG_FILE"
+    echo "" >> "$LOG_FILE"
+}
+
+log_line() {
+    # Write to log without ANSI codes
+    echo "$1" | sed 's/\x1b\[[0-9;]*m//g' >> "$LOG_FILE"
+}
+
+# info/success/warn/error with log duplication
+linfo()    { info "$1";    [ -n "$LOG_FILE" ] && log_line "[INFO]  $1"; }
+lsuccess() { success "$1"; [ -n "$LOG_FILE" ] && log_line "[OK]    $1"; }
+lwarn()    { warn "$1";    [ -n "$LOG_FILE" ] && log_line "[WARN]  $1"; }
+lerror()   { error "$1";   [ -n "$LOG_FILE" ] && log_line "[ERROR] $1"; }
+lstep()    { step "$1";    [ -n "$LOG_FILE" ] && log_line "\n>>> $1"; }
+
+download() {
+    local url="$1" dest="$2"
+    [ -n "$LOG_FILE" ] && log_line "DOWNLOAD: $url -> $dest"
+    if has_cmd curl; then
+        curl -fsSL --progress-bar "$url" -o "$dest"
+    elif has_cmd wget; then
+        wget -q --show-progress "$url" -O "$dest"
+    else
+        lerror "Need curl or wget!"; exit 1
+    fi
+}
+
+add_to_path() {
+    local p="$1"
+    for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
+        [ -f "$rc" ] && ! grep -qF "$p" "$rc" && {
+            printf '\n# Added by Tux\nexport PATH="%s:$PATH"\n' "$p" >> "$rc"
+        }
+    done
+    export PATH="$p:$PATH"
+}
+
+find_java()    {
+    [ -f "$JAVA_DIR/bin/java${EXE_EXT}" ]     && echo "$JAVA_DIR/bin/java${EXE_EXT}" && return
+    has_cmd java    && echo "java"    && return; echo ""
+}
+find_kotlinc() {
+    [ -f "$KOTLIN_DIR/bin/kotlinc" ]           && echo "$KOTLIN_DIR/bin/kotlinc" && return
+    [ -f "$KOTLIN_DIR/bin/kotlinc.bat" ]       && echo "$KOTLIN_DIR/bin/kotlinc.bat" && return
+    has_cmd kotlinc && echo "kotlinc" && return; echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  BANNER
+# ══════════════════════════════════════════════════════════════════
+print_banner() {
+    echo ""
+    echo -e "${CYAN}${BOLD}"
+    echo "  ████████╗██╗   ██╗██╗  ██╗"
+    echo "     ██╔══╝██║   ██║╚██╗██╔╝"
+    echo "     ██║   ██║   ██║ ╚███╔╝ "
+    echo "     ██║   ██║   ██║ ██╔██╗ "
+    echo "     ██║   ╚██████╔╝██╔╝ ██╗"
+    echo "     ╚═╝    ╚═════╝ ╚═╝  ╚═╝"
+    echo -e "${RESET}${DIM}  Package Manager v3.0  |  ${OS}${RESET}"
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  INTERACTIVE MENU (arrows + Enter)
+# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
+#  LANGUAGE SWITCH — closes current terminal, opens new one
+# ══════════════════════════════════════════════════════════════════
+_tux_switch_lang() {
+    local target_lang="$1"
+    local tux_bin
+    tux_bin="$(command -v tux 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+
+    # Detect terminal emulator
+    local terminal=""
+    for t in "$TERMINAL" x-terminal-emulator gnome-terminal xterm konsole xfce4-terminal lxterminal tilix alacritty kitty; do
+        [ -n "$t" ] && command -v "$t" &>/dev/null && terminal="$t" && break
+    done
+
+    if [ -n "$terminal" ]; then
+        case "$terminal" in
+            gnome-terminal)
+                nohup gnome-terminal -- bash -c "TUX_LANG=$target_lang $tux_bin; exec bash" &>/dev/null &
+                ;;
+            xfce4-terminal)
+                nohup xfce4-terminal -e "bash -c 'TUX_LANG=$target_lang $tux_bin; exec bash'" &>/dev/null &
+                ;;
+            konsole)
+                nohup konsole -e bash -c "TUX_LANG=$target_lang $tux_bin; exec bash" &>/dev/null &
+                ;;
+            *)
+                nohup "$terminal" -e "bash -c 'TUX_LANG=$target_lang $tux_bin; exec bash'" &>/dev/null &
+                ;;
+        esac
+        sleep 0.3
+    else
+        # No GUI — just restart tux with new language in the same terminal
+        clear
+        exec env TUX_LANG="$target_lang" "$tux_bin"
+    fi
+}
+
+
+interactive_menu() {
+    # Categories (RU)
+    local CATEGORIES_RU=(
+        "📦  Install languages"
+        "🔨  Build APK / AAB"
+        "📋  tux list — installed packages"
+        "📄  Build logs"
+        "🔧  Update APK tools"
+        "❓  Help"
+        "🌐  Switch to English"
+        "🚪  Exit"
+    )
+    # Categories (EN)
+    local CATEGORIES_EN=(
+        "📦  Install languages"
+        "🔨  Build APK / AAB"
+        "📋  tux list — installed packages"
+        "📄  Build logs"
+        "🔧  Update APK tools"
+        "❓  Help"
+        "🌐  Переключить на Русский"
+        "🚪  Exit"
+    )
+
+    # Install submenu (RU)
+    local INSTALL_ITEMS_RU=(
+        "☕  Java (Adoptium Temurin LTS)"
+        "🎯  Kotlin (JetBrains)"
+        "🐘  Gradle (latest stable)"
+        "🐍  Python (latest stable)"
+        "💚  Node.js (LTS)"
+        "← Back"
+    )
+    # Install submenu (EN)
+    local INSTALL_ITEMS_EN=(
+        "☕  Java (Adoptium Temurin LTS)"
+        "🎯  Kotlin (JetBrains)"
+        "🐘  Gradle (latest stable)"
+        "🐍  Python (latest stable)"
+        "💚  Node.js (LTS)"
+        "← Back"
+    )
+
+    # Build submenu (RU)
+    local BUILD_ITEMS_RU=(
+        "📱  APK (debug) from .kt files"
+        "📱  APK (release) — with your own signing key"
+        "📦  AAB (Android App Bundle for Google Play)"
+        "← Back"
+    )
+    # Build submenu (EN)
+    local BUILD_ITEMS_EN=(
+        "📱  APK (debug) from .kt files"
+        "📱  APK (release) — with your own signing key"
+        "📦  AAB (Android App Bundle for Google Play)"
+        "← Back"
+    )
+
+    # Select string set by language
+    local CATEGORIES=() INSTALL_ITEMS=() BUILD_ITEMS=()
+    if [ "$TUX_LANG" = "en" ]; then
+        CATEGORIES=("${CATEGORIES_EN[@]}")
+        INSTALL_ITEMS=("${INSTALL_ITEMS_EN[@]}")
+        BUILD_ITEMS=("${BUILD_ITEMS_EN[@]}")
+    else
+        CATEGORIES=("${CATEGORIES_RU[@]}")
+        INSTALL_ITEMS=("${INSTALL_ITEMS_RU[@]}")
+        BUILD_ITEMS=("${BUILD_ITEMS_RU[@]}")
+    fi
+
+    local sel=0
+    local in_sub=""
+
+    # Save/restore terminal settings
+    local old_tty=""
+    old_tty=$(stty -g 2>/dev/null || echo "")
+    trap '[ -n "$old_tty" ] && stty "$old_tty" 2>/dev/null; echo -e "${RESET}"; exit 0' INT TERM EXIT
+
+    while true; do
+        clear
+        print_banner
+
+        if [ -z "$in_sub" ]; then
+            if [ "$TUX_LANG" = "en" ]; then
+                echo -e "  ${BOLD}Main Menu${RESET}"
+            else
+                echo -e "  ${BOLD}Main Menu${RESET}"
+            fi
+            echo ""
+            local i=0
+            for item in "${CATEGORIES[@]}"; do
+                if [ $i -eq $sel ]; then
+                    echo -e "  ${REVERSE}${CYAN}  $item  ${RESET}"
+                else
+                    echo -e "     ${DIM}$item${RESET}"
+                fi
+                ((i++))
+            done
+            echo ""
+
+            # Show installed status
+            if [ "$TUX_LANG" = "en" ]; then
+                echo -e "  ${DIM}Installed: $(list_installed_short)${RESET}"
+            else
+                echo -e "  ${DIM}Installed: $(list_installed_short)${RESET}"
+            fi
+            echo ""
+
+            stty -echo -icanon min 1 time 0 2>/dev/null || true
+            local key
+            IFS= read -r -s -n1 key
+            if [[ "$key" == $'\x1b' ]]; then
+                IFS= read -r -s -n2 seq
+                case "$seq" in
+                    '[A') ((sel > 0)) && ((sel--)) ;;
+                    '[B') ((sel < ${#CATEGORIES[@]}-1)) && ((sel++)) ;;
+                esac
+            elif [[ "$key" == "" || "$key" == $'\n' ]]; then
+                stty "$old_tty" 2>/dev/null || true
+                case $sel in
+                    0) in_sub="install"; sel=0 ;;
+                    1) in_sub="build";   sel=0 ;;
+                    2) clear; show_list; echo ""; read -rsp "  Press Enter..."; sel=0 ;;
+                    3) clear; show_logs_menu; sel=0 ;;
+                    4) clear; update_tools; echo ""; read -rsp "  Press Enter..."; sel=0 ;;
+                    5) clear; show_help; echo ""; read -rsp "  Press Enter..."; sel=0 ;;
+                    6)
+                        # Language switch — close terminal and open new one with different language
+                        stty "$old_tty" 2>/dev/null; trap - INT TERM EXIT; echo -e "${RESET}"
+                        if [ "$TUX_LANG" = "ru" ]; then
+                            _tux_switch_lang "en"
+                        else
+                            _tux_switch_lang "ru"
+                        fi
+                        exit 0 ;;
+                    7) stty "$old_tty" 2>/dev/null; trap - INT TERM EXIT; echo -e "${RESET}"; exit 0 ;;
+                esac
+            fi
+
+        elif [ "$in_sub" = "install" ]; then
+            if [ "$TUX_LANG" = "en" ]; then
+                echo -e "  ${BOLD}Install languages${RESET}"
+            else
+                echo -e "  ${BOLD}Install languages${RESET}"
+            fi
+            echo ""
+            local i=0
+            for item in "${INSTALL_ITEMS[@]}"; do
+                if [ $i -eq $sel ]; then
+                    echo -e "  ${REVERSE}${CYAN}  $item  ${RESET}"
+                else
+                    echo -e "     ${DIM}$item${RESET}"
+                fi
+                ((i++))
+            done
+            echo ""
+
+            stty -echo -icanon min 1 time 0 2>/dev/null || true
+            local key
+            IFS= read -r -s -n1 key
+            if [[ "$key" == $'\x1b' ]]; then
+                IFS= read -r -s -n2 seq
+                case "$seq" in
+                    '[A') ((sel > 0)) && ((sel--)) ;;
+                    '[B') ((sel < ${#INSTALL_ITEMS[@]}-1)) && ((sel++)) ;;
+                esac
+            elif [[ "$key" == "" || "$key" == $'\n' ]]; then
+                stty "$old_tty" 2>/dev/null || true
+                clear
+                case $sel in
+                    0) install_java;   echo ""; read -rsp "  Press Enter..." ;;
+                    1) install_kotlin; echo ""; read -rsp "  Press Enter..." ;;
+                    2) install_gradle; echo ""; read -rsp "  Press Enter..." ;;
+                    3) install_python; echo ""; read -rsp "  Press Enter..." ;;
+                    4) install_node;   echo ""; read -rsp "  Press Enter..." ;;
+                    5) in_sub=""; sel=0; continue ;;
+                esac
+                in_sub="install"
+            fi
+
+        elif [ "$in_sub" = "build" ]; then
+            if [ "$TUX_LANG" = "en" ]; then
+                echo -e "  ${BOLD}Build APK / AAB${RESET}"
+            else
+                echo -e "  ${BOLD}Build APK / AAB${RESET}"
+            fi
+            echo ""
+            local i=0
+            for item in "${BUILD_ITEMS[@]}"; do
+                if [ $i -eq $sel ]; then
+                    echo -e "  ${REVERSE}${CYAN}  $item  ${RESET}"
+                else
+                    echo -e "     ${DIM}$item${RESET}"
+                fi
+                ((i++))
+            done
+            echo ""
+
+            stty -echo -icanon min 1 time 0 2>/dev/null || true
+            local key
+            IFS= read -r -s -n1 key
+            if [[ "$key" == $'\x1b' ]]; then
+                IFS= read -r -s -n2 seq
+                case "$seq" in
+                    '[A') ((sel > 0)) && ((sel--)) ;;
+                    '[B') ((sel < ${#BUILD_ITEMS[@]}-1)) && ((sel++)) ;;
+                esac
+            elif [[ "$key" == "" || "$key" == $'\n' ]]; then
+                stty "$old_tty" 2>/dev/null || true
+                clear
+                case $sel in
+                    0)
+                        echo -ne "  ${CYAN}Files (separated by +): ${RESET}"
+                        read -r files
+                        [ -n "$files" ] && install_apk "$files" "debug"
+                        echo ""; read -rsp "  Press Enter..."
+                        ;;
+                    1)
+                        echo -ne "  ${CYAN}Files (separated by +): ${RESET}"
+                        read -r files
+                        [ -n "$files" ] && install_apk "$files" "release"
+                        echo ""; read -rsp "  Press Enter..."
+                        ;;
+                    2)
+                        echo -ne "  ${CYAN}Files (separated by +): ${RESET}"
+                        read -r files
+                        [ -n "$files" ] && build_aab "$files"
+                        echo ""; read -rsp "  Press Enter..."
+                        ;;
+                    3) in_sub=""; sel=0; continue ;;
+                esac
+                in_sub="build"
+            fi
+        fi
+    done
+}
+
+# Short list of installed packages for status line
+list_installed_short() {
+    local installed=()
+    [ -f "$JAVA_DIR/bin/java${EXE_EXT}" ]   && installed+=("Java")
+    [ -d "$KOTLIN_DIR/bin" ]                && installed+=("Kotlin")
+    [ -d "$GRADLE_DIR/bin" ]                && installed+=("Gradle")
+    [ -d "$PYTHON_DIR" ]                    && installed+=("Python")
+    [ -d "$NODE_DIR/bin" ]                  && installed+=("Node.js")
+    [ ${#installed[@]} -eq 0 ] && echo "nothing" && return
+    local IFS=', '; echo "${installed[*]}"
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  TUX LIST — installed packages table
+# ══════════════════════════════════════════════════════════════════
+show_list() {
+    print_banner
+    echo -e "  ${BOLD}Installed components${RESET}"
+    echo ""
+    divider
+    printf "  ${BOLD}%-12s %-20s %-10s %s${RESET}\n" "Package" "Version" "Size" "Path"
+    divider
+
+    # Java
+    if [ -f "$JAVA_DIR/bin/java${EXE_EXT}" ]; then
+        local jv sz
+        jv=$("$JAVA_DIR/bin/java${EXE_EXT}" -version 2>&1 | head -1 | grep -oP '"\K[^"]+' | head -1)
+        sz=$(du -sh "$JAVA_DIR" 2>/dev/null | cut -f1)
+        printf "  ${GREEN}✓${RESET} %-10s %-20s %-10s ${DIM}%s${RESET}\n" "Java" "$jv" "$sz" "$JAVA_DIR"
+    else
+        printf "  ${RED}✗${RESET} %-10s ${DIM}%-20s${RESET}\n" "Java" "not installed"
+    fi
+
+    # Kotlin
+    local kc; kc="$(find_kotlinc)"
+    if [ -n "$kc" ]; then
+        local kv sz
+        kv=$("$kc" -version 2>&1 | grep -oP 'kotlinc-jvm \K\S+' | head -1)
+        [ -z "$kv" ] && kv=$("$kc" -version 2>&1 | head -1 | awk '{print $NF}')
+        sz=$(du -sh "$KOTLIN_DIR" 2>/dev/null | cut -f1)
+        printf "  ${GREEN}✓${RESET} %-10s %-20s %-10s ${DIM}%s${RESET}\n" "Kotlin" "$kv" "$sz" "$KOTLIN_DIR"
+    else
+        printf "  ${RED}✗${RESET} %-10s ${DIM}%-20s${RESET}\n" "Kotlin" "not installed"
+    fi
+
+    # Gradle
+    if [ -f "$GRADLE_DIR/bin/gradle" ] || [ -f "$GRADLE_DIR/bin/gradle.bat" ]; then
+        local gv sz
+        gv=$("$GRADLE_DIR/bin/gradle" --version 2>/dev/null | grep "^Gradle" | awk '{print $2}')
+        sz=$(du -sh "$GRADLE_DIR" 2>/dev/null | cut -f1)
+        printf "  ${GREEN}✓${RESET} %-10s %-20s %-10s ${DIM}%s${RESET}\n" "Gradle" "$gv" "$sz" "$GRADLE_DIR"
+    else
+        printf "  ${RED}✗${RESET} %-10s ${DIM}%-20s${RESET}\n" "Gradle" "not installed"
+    fi
+
+    # Python
+    if [ -f "$PYTHON_DIR/bin/python3" ] || [ -f "$PYTHON_DIR/python.exe" ]; then
+        local pv sz pbin
+        pbin="${PYTHON_DIR}/bin/python3"; [ "$OS" = "windows" ] && pbin="$PYTHON_DIR/python.exe"
+        pv=$("$pbin" --version 2>&1 | awk '{print $2}')
+        sz=$(du -sh "$PYTHON_DIR" 2>/dev/null | cut -f1)
+        printf "  ${GREEN}✓${RESET} %-10s %-20s %-10s ${DIM}%s${RESET}\n" "Python" "$pv" "$sz" "$PYTHON_DIR"
+    else
+        printf "  ${RED}✗${RESET} %-10s ${DIM}%-20s${RESET}\n" "Python" "not installed"
+    fi
+
+    # Node.js
+    if [ -f "$NODE_DIR/bin/node" ] || [ -f "$NODE_DIR/node.exe" ]; then
+        local nv sz nbin
+        nbin="$NODE_DIR/bin/node"; [ "$OS" = "windows" ] && nbin="$NODE_DIR/node.exe"
+        nv=$("$nbin" --version 2>/dev/null)
+        sz=$(du -sh "$NODE_DIR" 2>/dev/null | cut -f1)
+        printf "  ${GREEN}✓${RESET} %-10s %-20s %-10s ${DIM}%s${RESET}\n" "Node.js" "$nv" "$sz" "$NODE_DIR"
+    else
+        printf "  ${RED}✗${RESET} %-10s ${DIM}%-20s${RESET}\n" "Node.js" "not installed"
+    fi
+
+    divider
+    echo ""
+
+    # APK tools
+    echo -e "  ${BOLD}APK Tools:${RESET}"
+    echo ""
+    for item in "r8.jar:R8/D8 DEX" "android.jar:Android API" "apksig.jar:APK Signer" "tux.keystore:Keystore"; do
+        local f="${item%%:*}" lbl="${item##*:}"
+        if [ -f "$TOOLS_DIR/$f" ]; then
+            local sz; sz=$(du -sh "$TOOLS_DIR/$f" | cut -f1)
+            printf "    ${GREEN}✓${RESET} %-16s ${DIM}%s${RESET}\n" "$lbl" "$sz"
+        else
+            printf "    ${YELLOW}–${RESET} %-16s ${DIM}(will be downloaded on build)${RESET}\n" "$lbl"
+        fi
+    done
+
+    echo ""
+    # Logs
+    if [ -d "$LOGS_DIR" ]; then
+        local log_count; log_count=$(ls "$LOGS_DIR"/*.log 2>/dev/null | wc -l)
+        echo -e "  ${DIM}Build logs: ${log_count}  (${CYAN}tux logs${RESET}${DIM})${RESET}"
+    fi
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  LOGS
+# ══════════════════════════════════════════════════════════════════
+show_logs_menu() {
+    print_banner
+    echo -e "  ${BOLD}Build Logs${RESET}  ${DIM}(${LOGS_DIR})${RESET}"
+    echo ""
+
+    if [ ! -d "$LOGS_DIR" ] || [ -z "$(ls "$LOGS_DIR"/*.log 2>/dev/null)" ]; then
+        warn "No logs yet. Build an APK/AAB and the log will appear."
+        echo ""
+        return
+    fi
+
+    divider
+    local i=1
+    local files=()
+    while IFS= read -r f; do
+        files+=("$f")
+        local size; size=$(du -sh "$f" | cut -f1)
+        local name; name=$(basename "$f")
+        printf "  ${CYAN}[%d]${RESET} %-40s ${DIM}%s${RESET}\n" "$i" "$name" "$size"
+        ((i++))
+    done < <(ls -t "$LOGS_DIR"/*.log 2>/dev/null | head -20)
+    divider
+    echo ""
+    echo -ne "  Open log [1-$((i-1))] or Enter to exit: "
+    read -r choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -lt "$i" ]; then
+        local idx=$((choice-1))
+        echo ""
+        echo -e "${DIM}$(cat "${files[$idx]}")${RESET}"
+        echo ""
+    fi
+}
+
+show_logs() {
+    print_banner
+    show_logs_menu
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  INSTALL JAVA
+# ══════════════════════════════════════════════════════════════════
+install_java() {
+    print_banner
+    log_init "install_java"
+    lstep "Installing Java (latest LTS — Adoptium Temurin)"
+    divider
+
+    local arch
+    case "$(uname -m)" in
+        x86_64|amd64)  arch="x64"     ;;
+        aarch64|arm64) arch="aarch64" ;;
+        *)             arch="x64"     ;;
+    esac
+    local api_os; [ "$OS" = "windows" ] && api_os="windows" || api_os="linux"
+    [ "$OS" = "mac" ] && api_os="mac"
+
+    linfo "Platform: ${BOLD}${api_os}/${arch}${RESET}"
+    linfo "Querying api.adoptium.net..."
+
+    local meta url version
+    meta=$(curl -fsSL \
+        "https://api.adoptium.net/v3/assets/latest/21/hotspot?architecture=${arch}&image_type=jdk&os=${api_os}&vendor=eclipse" \
+        2>/dev/null) || { lerror "Cannot reach api.adoptium.net"; exit 1; }
+
+    url=$(echo "$meta"     | grep -o '"link":"[^"]*"'           | head -1 | cut -d'"' -f4)
+    version=$(echo "$meta" | grep -o '"openjdk_version":"[^"]*"' | head -1 | cut -d'"' -f4)
+    [ -z "$url" ] && { lerror "Could not get download URL"; exit 1; }
+    linfo "Version: ${BOLD}${version}${RESET}"
+    log_line "URL: $url"
+
+    local ext="tar.gz"
+    [ "$OS" = "windows" ] && ext="zip"
+    [ "$OS" = "mac" ]     && ext="tar.gz"
+    local archive="$TMP_DIR/jdk.${ext}"
+    mkdir -p "$TMP_DIR"
+
+    lstep "Downloading JDK ${version}..."
+    download "$url" "$archive"
+
+    lstep "Extracting..."
+    rm -rf "$JAVA_DIR"; mkdir -p "$JAVA_DIR"
+    if [ "$ext" = "zip" ]; then
+        unzip -q "$archive" -d "$TMP_DIR/jdk_tmp"
+        local inner; inner=$(ls "$TMP_DIR/jdk_tmp" | head -1)
+        mv "$TMP_DIR/jdk_tmp/$inner"/* "$JAVA_DIR/" 2>/dev/null || \
+        mv "$TMP_DIR/jdk_tmp/$inner"   "$JAVA_DIR/"
+        rm -rf "$TMP_DIR/jdk_tmp"
+    else
+        tar -xzf "$archive" -C "$JAVA_DIR" --strip-components=1
+    fi
+    rm -f "$archive"
+
+    mkdir -p "$BIN_DIR"
+    if [ "$OS" = "windows" ]; then
+        for b in java javac jar keytool; do
+            [ -f "$JAVA_DIR/bin/${b}.exe" ] && cp "$JAVA_DIR/bin/${b}.exe" "$BIN_DIR/${b}.exe"
+        done
+    else
+        for b in java javac jar keytool; do ln -sf "$JAVA_DIR/bin/$b" "$BIN_DIR/$b"; done
+    fi
+
+    add_to_path "$BIN_DIR"
+    export JAVA_HOME="$JAVA_DIR"
+    for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
+        [ -f "$rc" ] && ! grep -q "JAVA_HOME" "$rc" && \
+            echo "export JAVA_HOME=\"$JAVA_DIR\"" >> "$rc"
+    done
+
+    echo ""
+    divider
+    lsuccess "Java ${version} installed!"
+    echo -e "  ${DIM}JAVA_HOME = $JAVA_DIR${RESET}"
+    echo -e "  ${DIM}Log: ${LOG_FILE}${RESET}"
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  INSTALL KOTLIN
+# ══════════════════════════════════════════════════════════════════
+install_kotlin() {
+    print_banner
+    log_init "install_kotlin"
+    lstep "Installing Kotlin (latest version — JetBrains)"
+    divider
+
+    [ -z "$(find_java)" ] && {
+        lwarn "Java not found — Kotlin requires Java"
+        echo -ne "  Install Java automatically? [Y/n]: "
+        read -r ans
+        [[ "$ans" =~ ^[Nn]$ ]] && { lerror "Cancelled"; exit 1; }
+        install_java
+    }
+
+    linfo "Querying GitHub Releases API..."
+    local meta version
+    meta=$(curl -fsSL "https://api.github.com/repos/JetBrains/kotlin/releases/latest" 2>/dev/null) || {
+        lerror "Cannot reach GitHub API"; exit 1
+    }
+    version=$(echo "$meta" | grep '"tag_name"' | head -1 | cut -d'"' -f4 | sed 's/^v//')
+    [ -z "$version" ] && { lerror "Could not determine Kotlin version"; exit 1; }
+
+    local url="https://github.com/JetBrains/kotlin/releases/download/v${version}/kotlin-compiler-${version}.zip"
+    linfo "Version: ${BOLD}${version}${RESET}"
+
+    local archive="$TMP_DIR/kotlin.zip"
+    mkdir -p "$TMP_DIR"
+    lstep "Downloading Kotlin Compiler ${version}..."
+    download "$url" "$archive"
+
+    lstep "Extracting..."
+    rm -rf "$KOTLIN_DIR"
+    unzip -q "$archive" -d "$INSTALL_DIR"
+    mv "$INSTALL_DIR/kotlinc" "$KOTLIN_DIR"
+    rm -f "$archive"
+
+    mkdir -p "$BIN_DIR"
+    if [ "$OS" = "windows" ]; then
+        [ -f "$KOTLIN_DIR/bin/kotlinc.bat" ] && cp "$KOTLIN_DIR/bin/kotlinc.bat" "$BIN_DIR/kotlinc.bat"
+        printf '#!/usr/bin/env bash\nexec "%s/bin/kotlinc.bat" "$@"\n' "$KOTLIN_DIR" > "$BIN_DIR/kotlinc"
+        chmod +x "$BIN_DIR/kotlinc"
+    else
+        ln -sf "$KOTLIN_DIR/bin/kotlinc" "$BIN_DIR/kotlinc"
+        ln -sf "$KOTLIN_DIR/bin/kotlin"  "$BIN_DIR/kotlin"
+    fi
+    add_to_path "$BIN_DIR"
+
+    echo ""
+    divider
+    lsuccess "Kotlin ${version} installed!"
+    echo -e "  ${DIM}Log: ${LOG_FILE}${RESET}"
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  INSTALL GRADLE
+# ══════════════════════════════════════════════════════════════════
+install_gradle() {
+    print_banner
+    log_init "install_gradle"
+    lstep "Installing Gradle (latest stable)"
+    divider
+
+    [ -z "$(find_java)" ] && {
+        lwarn "Java not found — Gradle requires Java"
+        echo -ne "  Install Java? [Y/n]: "
+        read -r ans
+        [[ "$ans" =~ ^[Nn]$ ]] && { lerror "Cancelled"; exit 1; }
+        install_java
+    }
+
+    linfo "Querying services.gradle.org..."
+    local version
+    version=$(curl -fsSL "https://services.gradle.org/versions/current" 2>/dev/null \
+        | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)
+    [ -z "$version" ] && { lerror "Could not get Gradle version"; exit 1; }
+
+    local url="https://services.gradle.org/distributions/gradle-${version}-bin.zip"
+    linfo "Version: ${BOLD}${version}${RESET}"
+
+    local archive="$TMP_DIR/gradle.zip"
+    mkdir -p "$TMP_DIR"
+    lstep "Downloading Gradle ${version}..."
+    download "$url" "$archive"
+
+    lstep "Extracting..."
+    rm -rf "$GRADLE_DIR"
+    unzip -q "$archive" -d "$INSTALL_DIR"
+    mv "$INSTALL_DIR/gradle-${version}" "$GRADLE_DIR"
+    rm -f "$archive"
+
+    mkdir -p "$BIN_DIR"
+    if [ "$OS" = "windows" ]; then
+        [ -f "$GRADLE_DIR/bin/gradle.bat" ] && cp "$GRADLE_DIR/bin/gradle.bat" "$BIN_DIR/gradle.bat"
+        printf '#!/usr/bin/env bash\nexec "%s/bin/gradle.bat" "$@"\n' "$GRADLE_DIR" > "$BIN_DIR/gradle"
+        chmod +x "$BIN_DIR/gradle"
+    else
+        ln -sf "$GRADLE_DIR/bin/gradle" "$BIN_DIR/gradle"
+    fi
+    add_to_path "$BIN_DIR"
+
+    echo ""
+    divider
+    lsuccess "Gradle ${version} installed!"
+    echo -e "  ${DIM}Check: gradle --version${RESET}"
+    echo -e "  ${DIM}Log: ${LOG_FILE}${RESET}"
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  INSTALL PYTHON
+# ══════════════════════════════════════════════════════════════════
+install_python() {
+    print_banner
+    log_init "install_python"
+    lstep "Installing Python (latest stable)"
+    divider
+
+    # Determine latest version via python.org API
+    linfo "Querying python.org..."
+    local version
+    version=$(curl -fsSL "https://endoflife.date/api/python.json" 2>/dev/null \
+        | grep -o '"latest":"[^"]*"' | head -1 | cut -d'"' -f4)
+    [ -z "$version" ] && version="3.12.3"  # fallback
+    linfo "Version: ${BOLD}${version}${RESET}"
+
+    if [ "$OS" = "linux" ]; then
+        # Check if system Python is sufficient
+        if has_cmd python3; then
+            local sys_ver
+            sys_ver=$(python3 --version 2>&1 | awk '{print $2}')
+            linfo "System Python: $sys_ver"
+            echo -ne "  Use system Python ${sys_ver}? [Y/n]: "
+            read -r ans
+            if [[ ! "$ans" =~ ^[Nn]$ ]]; then
+                local py_bin; py_bin=$(which python3)
+                mkdir -p "$PYTHON_DIR/bin"
+                ln -sf "$py_bin" "$PYTHON_DIR/bin/python3"
+                lsuccess "Python $sys_ver (system) registered"
+                return
+            fi
+        fi
+
+        # Install via package manager
+        if has_cmd apt-get; then
+            linfo "Installing via apt..."
+            sudo apt-get update -qq && sudo apt-get install -y python3 python3-pip
+            local py_bin; py_bin=$(which python3)
+            mkdir -p "$PYTHON_DIR/bin"
+            ln -sf "$py_bin" "$PYTHON_DIR/bin/python3"
+        elif has_cmd dnf; then
+            sudo dnf install -y python3 python3-pip
+            mkdir -p "$PYTHON_DIR/bin"
+            ln -sf "$(which python3)" "$PYTHON_DIR/bin/python3"
+        elif has_cmd pacman; then
+            sudo pacman -S --noconfirm python python-pip
+            mkdir -p "$PYTHON_DIR/bin"
+            ln -sf "$(which python3)" "$PYTHON_DIR/bin/python3"
+        else
+            # Download portable Python via pyenv
+            linfo "Installing via pyenv..."
+            if [ ! -d "$HOME/.pyenv" ]; then
+                curl -fsSL https://pyenv.run | bash
+            fi
+            export PYENV_ROOT="$HOME/.pyenv"
+            export PATH="$PYENV_ROOT/bin:$PATH"
+            eval "$(pyenv init -)"
+            pyenv install -s "$version"
+            pyenv global "$version"
+            mkdir -p "$PYTHON_DIR/bin"
+            ln -sf "$(pyenv which python3)" "$PYTHON_DIR/bin/python3"
+        fi
+
+    elif [ "$OS" = "windows" ]; then
+        # Windows — download embeddable python
+        local arch="amd64"
+        local py_short="${version%.*}"
+        local url="https://www.python.org/ftp/python/${version}/python-${version}-embed-amd64.zip"
+        local archive="$TMP_DIR/python.zip"
+        mkdir -p "$TMP_DIR"
+        lstep "Downloading Python ${version} (embeddable)..."
+        download "$url" "$archive"
+        lstep "Extracting..."
+        rm -rf "$PYTHON_DIR"; mkdir -p "$PYTHON_DIR"
+        unzip -q "$archive" -d "$PYTHON_DIR"
+        rm -f "$archive"
+        mkdir -p "$BIN_DIR"
+        cp "$PYTHON_DIR/python.exe" "$BIN_DIR/python3.exe" 2>/dev/null || true
+
+    elif [ "$OS" = "mac" ]; then
+        if has_cmd brew; then
+            brew install python3
+            mkdir -p "$PYTHON_DIR/bin"
+            ln -sf "$(which python3)" "$PYTHON_DIR/bin/python3"
+        else
+            lwarn "Install Homebrew for macOS: brew install python3"
+        fi
+    fi
+
+    add_to_path "$BIN_DIR"
+
+    echo ""
+    divider
+    lsuccess "Python installed!"
+    [ -f "$PYTHON_DIR/bin/python3" ] && \
+        echo -e "  ${DIM}Version: $("$PYTHON_DIR/bin/python3" --version 2>&1)${RESET}"
+    echo -e "  ${DIM}Log: ${LOG_FILE}${RESET}"
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  INSTALL NODE.JS
+# ══════════════════════════════════════════════════════════════════
+install_node() {
+    print_banner
+    log_init "install_node"
+    lstep "Installing Node.js (LTS)"
+    divider
+
+    linfo "Querying nodejs.org..."
+    local meta version
+    meta=$(curl -fsSL "https://nodejs.org/dist/index.json" 2>/dev/null)
+    # Get latest LTS
+    version=$(echo "$meta" | grep -o '"version":"[^"]*","date":"[^"]*","files":[^,]*,"npm":"[^"]*","v8":"[^"]*","uv":"[^"]*","zlib":"[^"]*","openssl":"[^"]*","modules":"[^"]*","lts":"[^"]*"' \
+        | grep '"lts":"[^f]' | head -1 | grep -o '"version":"[^"]*"' | cut -d'"' -f4 | sed 's/^v//')
+    # fallback simple method
+    [ -z "$version" ] && version=$(echo "$meta" | python3 -c \
+        "import sys,json; d=json.load(sys.stdin); \
+         lts=[x for x in d if x.get('lts') and x.get('lts')!=False]; \
+         print(lts[0]['version'].lstrip('v')) if lts else print('20.11.0')" 2>/dev/null || echo "20.11.0")
+
+    linfo "Version: ${BOLD}${version}${RESET}"
+
+    local arch_str platform
+    case "$(uname -m)" in
+        x86_64|amd64)  arch_str="x64"   ;;
+        aarch64|arm64) arch_str="arm64" ;;
+        *)             arch_str="x64"   ;;
+    esac
+
+    local url ext
+    case "$OS" in
+        linux)
+            ext="tar.xz"
+            url="https://nodejs.org/dist/v${version}/node-v${version}-linux-${arch_str}.${ext}"
+            ;;
+        mac)
+            ext="tar.gz"
+            url="https://nodejs.org/dist/v${version}/node-v${version}-darwin-${arch_str}.${ext}"
+            ;;
+        windows)
+            ext="zip"
+            url="https://nodejs.org/dist/v${version}/node-v${version}-win-${arch_str}.${ext}"
+            ;;
+    esac
+
+    local archive="$TMP_DIR/node.${ext}"
+    mkdir -p "$TMP_DIR"
+    lstep "Downloading Node.js ${version}..."
+    download "$url" "$archive"
+
+    lstep "Extracting..."
+    rm -rf "$NODE_DIR"; mkdir -p "$NODE_DIR"
+    if [ "$ext" = "zip" ]; then
+        unzip -q "$archive" -d "$TMP_DIR/node_tmp"
+        local inner; inner=$(ls "$TMP_DIR/node_tmp" | head -1)
+        mv "$TMP_DIR/node_tmp/$inner"/* "$NODE_DIR/"
+        rm -rf "$TMP_DIR/node_tmp"
+    elif [ "$ext" = "tar.xz" ]; then
+        tar -xJf "$archive" -C "$NODE_DIR" --strip-components=1
+    else
+        tar -xzf "$archive" -C "$NODE_DIR" --strip-components=1
+    fi
+    rm -f "$archive"
+
+    mkdir -p "$BIN_DIR"
+    if [ "$OS" = "windows" ]; then
+        [ -f "$NODE_DIR/node.exe" ] && cp "$NODE_DIR/node.exe" "$BIN_DIR/node.exe"
+        [ -f "$NODE_DIR/npm.cmd" ]  && cp "$NODE_DIR/npm.cmd"  "$BIN_DIR/npm.cmd"
+    else
+        ln -sf "$NODE_DIR/bin/node" "$BIN_DIR/node"
+        ln -sf "$NODE_DIR/bin/npm"  "$BIN_DIR/npm"
+        [ -f "$NODE_DIR/bin/npx" ] && ln -sf "$NODE_DIR/bin/npx" "$BIN_DIR/npx"
+    fi
+    add_to_path "$BIN_DIR"
+
+    echo ""
+    divider
+    lsuccess "Node.js ${version} installed!"
+    echo -e "  ${DIM}node --version && npm --version${RESET}"
+    echo -e "  ${DIM}Log: ${LOG_FILE}${RESET}"
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  DOWNLOAD APK TOOLS
+# ══════════════════════════════════════════════════════════════════
+ensure_apk_tools() {
+    local force="${1:-}"
+    local need=false
+    [ ! -f "$TOOLS_DIR/r8.jar"      ] && need=true
+    [ ! -f "$TOOLS_DIR/android.jar" ] && need=true
+    [ ! -f "$TOOLS_DIR/apksig.jar"  ] && need=true
+    [ -n "$force" ] && need=true
+    [ "$need" = false ] && return 0
+
+    step "Downloading APK build tools..."
+    mkdir -p "$TOOLS_DIR"
+
+    if [ ! -f "$TOOLS_DIR/r8.jar" ] || [ -n "$force" ]; then
+        info "R8/D8 DEX Compiler (Google Maven)..."
+        download "$D8_URL" "$TOOLS_DIR/r8.jar" 2>/dev/null || \
+        download "$D8_FB"  "$TOOLS_DIR/r8.jar" || { error "Failed to download r8.jar"; exit 1; }
+        success "  r8.jar ($(du -sh "$TOOLS_DIR/r8.jar" | cut -f1))"
+    fi
+
+    if [ ! -f "$TOOLS_DIR/android.jar" ] || [ -n "$force" ]; then
+        info "Android API stubs (android.jar)..."
+        download "$ANDROID_JAR_URL"  "$TOOLS_DIR/android.jar" 2>/dev/null || \
+        download "$ANDROID_JAR_FB1"  "$TOOLS_DIR/android.jar" 2>/dev/null || \
+        download "$ANDROID_JAR_FB2"  "$TOOLS_DIR/android.jar" || { error "Failed to download android.jar"; exit 1; }
+        success "  android.jar ($(du -sh "$TOOLS_DIR/android.jar" | cut -f1))"
+    fi
+
+    if [ ! -f "$TOOLS_DIR/apksig.jar" ] || [ -n "$force" ]; then
+        info "APK Signer (apksig, Google Maven)..."
+        download "$APKSIG_URL" "$TOOLS_DIR/apksig.jar" 2>/dev/null || \
+        download "$APKSIG_FB"  "$TOOLS_DIR/apksig.jar" 2>/dev/null || \
+            warn "  apksig failed to download — APK will be unsigned"
+        [ -f "$TOOLS_DIR/apksig.jar" ] && \
+            success "  apksig.jar ($(du -sh "$TOOLS_DIR/apksig.jar" | cut -f1))"
+    fi
+
+    # Generate debug keystore
+    if [ ! -f "$TOOLS_DIR/tux-debug.keystore" ]; then
+        local kt="$JAVA_DIR/bin/keytool${EXE_EXT}"
+        has_cmd keytool && kt="keytool"
+        if [ -f "$kt" ] || has_cmd keytool; then
+            info "Generating debug keystore..."
+            "$kt" -genkeypair \
+                -keystore "$TOOLS_DIR/tux-debug.keystore" \
+                -alias tuxdebug -keyalg RSA -keysize 2048 -validity 9999 \
+                -storepass tuxdebug -keypass tuxdebug \
+                -dname "CN=TuxDebug,O=Tux,C=US" 2>/dev/null && \
+                success "  tux-debug.keystore created" || warn "  Keystore not created"
+        fi
+    fi
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  PACK APK INTO ZIP
+# ══════════════════════════════════════════════════════════════════
+pack_apk_zip() {
+    local apk_dir="$1" output="$2"
+    # List of files to pack
+    local files=()
+    [ -f "$apk_dir/classes.dex"         ] && files+=("classes.dex")
+    [ -f "$apk_dir/AndroidManifest.xml" ] && files+=("AndroidManifest.xml")
+    [ -d "$apk_dir/res"                 ] && files+=("res")
+
+    cd "$apk_dir"
+    if has_cmd zip; then
+        zip -qr "$output" "${files[@]}"
+    elif [ "$OS" = "windows" ] && has_cmd powershell; then
+        local win_out="${output//\//\\}"
+        powershell -NoProfile -Command "
+            Add-Type -Assembly 'System.IO.Compression.FileSystem'
+            \$z = [IO.Compression.ZipFile]::Open('${win_out}','Create')
+            foreach (\$f in @($(printf "'%s'," "${files[@]}"))) {
+                [IO.Compression.ZipFileExtensions]::CreateEntryFromFile(\$z,\$f,\$f) | Out-Null
+            }
+            \$z.Dispose()
+        " || { error "PowerShell zip failed"; cd - >/dev/null; exit 1; }
+    elif has_cmd python3; then
+        python3 -c "
+import zipfile, os, sys
+files = sys.argv[1:]
+with zipfile.ZipFile('${output}','w',zipfile.ZIP_DEFLATED) as z:
+    for f in files:
+        if os.path.isdir(f):
+            for root,dirs,fs in os.walk(f):
+                for ff in fs: z.write(os.path.join(root,ff))
+        else:
+            z.write(f)
+" "${files[@]}"
+    else
+        error "Need zip, PowerShell or python3"; cd - >/dev/null; exit 1
+    fi
+    cd - >/dev/null
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  GENERATE AndroidManifest.xml
+# ══════════════════════════════════════════════════════════════════
+gen_manifest() {
+    local dest="$1" pkg="$2" app_name="$3" main_activity="${4:-MainActivity}"
+    cat > "$dest" << MANIFEST
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="${pkg}" android:versionCode="1" android:versionName="1.0">
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="34"/>
+    <application android:label="${app_name}" android:allowBackup="true">
+        <activity android:name=".${main_activity}" android:exported="true"
+            android:configChanges="orientation|screenSize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
+MANIFEST
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  SIGN APK
+# ══════════════════════════════════════════════════════════════════
+sign_apk() {
+    local java_bin="$1" unsigned="$2" output="$3" keystore="$4" alias="$5" storepass="$6" keypass="$7"
+
+    set +e
+    "$java_bin" -jar "$TOOLS_DIR/apksig.jar" sign \
+        --ks "$keystore" --ks-pass "pass:$storepass" \
+        --ks-key-alias "$alias" --key-pass "pass:$keypass" \
+        --in "$unsigned" --out "$output" 2>&1 | \
+        while IFS= read -r l; do
+            echo -e "    ${DIM}${l}${RESET}"
+            [ -n "$LOG_FILE" ] && log_line "$l"
+        done
+    local rc=${PIPESTATUS[0]}
+    set -e
+    return $rc
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  BUILD APK (debug / release)
+# ══════════════════════════════════════════════════════════════════
+install_apk() {
+    local raw_files="$1"
+    local mode="${2:-debug}"   # debug | release
+    print_banner
+    log_init "build_apk_${mode}"
+    lstep "Building APK [${mode}] — standalone mode"
+    divider
+
+    [ -z "$raw_files" ] && { lerror "No files specified"; exit 1; }
+    IFS='+' read -ra FILES <<< "$raw_files"
+
+    lstep "Checking source files..."
+    local all_ok=true
+    for i in "${!FILES[@]}"; do
+        FILES[$i]="$(echo "${FILES[$i]}" | xargs)"
+        if [ -f "${FILES[$i]}" ]; then lsuccess "  ${FILES[$i]}"
+        else lerror "  ${FILES[$i]} — not found"; all_ok=false; fi
+    done
+    $all_ok || { lerror "Fix the file paths"; exit 1; }
+
+    lstep "Checking environment..."
+    local java_bin; java_bin="$(find_java)"
+    [ -z "$java_bin" ] && { lerror "Java not installed: tux install java"; exit 1; }
+    lsuccess "  Java: $($java_bin -version 2>&1 | head -1)"
+
+    local kotlinc_bin; kotlinc_bin="$(find_kotlinc)"
+    [ -z "$kotlinc_bin" ] && { lerror "Kotlin not installed: tux install kotlin"; exit 1; }
+    lsuccess "  Kotlin: $($kotlinc_bin -version 2>&1 | head -1)"
+
+    ensure_apk_tools
+
+    local project_name
+    project_name="$(basename "${FILES[0]}" .kt | sed 's/[^a-zA-Z0-9_]//g')"
+    local pkg_name="com.tux.$(echo "$project_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g')"
+    local build_dir="$TMP_DIR/${project_name}_$$"
+    local output_apk="$(pwd)/${project_name}-${mode}.apk"
+
+    rm -rf "$build_dir"
+    mkdir -p "$build_dir/src" "$build_dir/dex" "$build_dir/apk"
+    for f in "${FILES[@]}"; do cp "$f" "$build_dir/src/"; done
+
+    linfo "Project: ${BOLD}${project_name}${RESET}"
+    linfo "Mode:    ${BOLD}${mode}${RESET}"
+
+    # ── Шаг 1: Kotlin → JAR ───────────────────────────────────
+    lstep "Step 1/5 — Kotlin → JAR..."
+    local kt_files=()
+    for f in "${FILES[@]}"; do kt_files+=("$build_dir/src/$(basename "$f")"); done
+
+    set +e
+    "$kotlinc_bin" -classpath "$TOOLS_DIR/android.jar" \
+        "${kt_files[@]}" -include-runtime -d "$build_dir/app.jar" 2>&1 | \
+        while IFS= read -r l; do
+            echo -e "    ${DIM}${l}${RESET}"
+            [ -n "$LOG_FILE" ] && log_line "$l"
+        done
+    local kc_rc=${PIPESTATUS[0]}
+    set -e
+    [ $kc_rc -ne 0 ] && { lerror "Kotlin compilation error"; rm -rf "$build_dir"; exit 1; }
+    lsuccess "  → app.jar ($(du -sh "$build_dir/app.jar" | cut -f1))"
+
+    # ── Шаг 2: JAR → DEX ──────────────────────────────────────
+    lstep "Step 2/5 — JAR → Android DEX (R8/D8)..."
+    local d8_args=(
+        -cp "$TOOLS_DIR/r8.jar" com.android.tools.r8.D8
+        --min-api 21
+        --lib "$TOOLS_DIR/android.jar"
+        --output "$build_dir/dex/"
+    )
+    [ "$mode" = "release" ] && d8_args+=(--release)
+
+    set +e
+    "$java_bin" "${d8_args[@]}" "$build_dir/app.jar" 2>&1 | \
+        while IFS= read -r l; do
+            echo -e "    ${DIM}${l}${RESET}"
+            [ -n "$LOG_FILE" ] && log_line "$l"
+        done
+    local d8_rc=${PIPESTATUS[0]}
+    set -e
+
+    if [ $d8_rc -ne 0 ] || [ ! -f "$build_dir/dex/classes.dex" ]; then
+        lwarn "  Retrying without --release..."
+        "$java_bin" -cp "$TOOLS_DIR/r8.jar" com.android.tools.r8.D8 \
+            --min-api 21 --lib "$TOOLS_DIR/android.jar" \
+            --output "$build_dir/dex/" "$build_dir/app.jar" || \
+            { lerror "DEX conversion failed"; rm -rf "$build_dir"; exit 1; }
+    fi
+    lsuccess "  → classes.dex ($(du -sh "$build_dir/dex/classes.dex" | cut -f1))"
+
+    # ── Шаг 3: Манифест ───────────────────────────────────────
+    lstep "Step 3/5 — Generating AndroidManifest.xml..."
+    local main_activity="MainActivity"
+    for f in "${FILES[@]}"; do
+        if grep -qE "class .+(Activity|Fragment)|fun main\b" "$f" 2>/dev/null; then
+            local found; found=$(grep -oE 'class [A-Za-z]+' "$f" | head -1 | awk '{print $2}')
+            [ -n "$found" ] && main_activity="$found" && break
+        fi
+    done
+    cp "$build_dir/dex/classes.dex" "$build_dir/apk/"
+    gen_manifest "$build_dir/apk/AndroidManifest.xml" "$pkg_name" "$project_name" "$main_activity"
+    lsuccess "  → AndroidManifest.xml (pkg: ${pkg_name})"
+
+    # ── Шаг 4: Упаковка ZIP ───────────────────────────────────
+    lstep "Step 4/5 — Packing APK..."
+    local unsigned="$build_dir/${project_name}-unsigned.apk"
+    pack_apk_zip "$build_dir/apk" "$unsigned"
+    lsuccess "  → unsigned APK"
+
+    # ── Шаг 5: Подпись ────────────────────────────────────────
+    lstep "Step 5/5 — Signing APK (${mode})..."
+
+    local keystore alias storepass keypass
+    if [ "$mode" = "release" ]; then
+        echo ""
+        echo -e "  ${BOLD}Release signing parameters:${RESET}"
+        echo -ne "  Path to keystore [Enter = create new]: "
+        read -r ks_path
+        if [ -z "$ks_path" ]; then
+            # Create release keystore
+            local rel_ks="$(pwd)/${project_name}-release.keystore"
+            echo -ne "  Key alias [${project_name}]: "; read -r ks_alias
+            echo -ne "  Keystore password: "; read -rs ks_pass; echo ""
+            ks_alias="${ks_alias:-$project_name}"
+            echo -ne "  Name (CN) [My App]: "; read -r ks_cn; ks_cn="${ks_cn:-My App}"
+            "$java_bin" -jar "$JAVA_DIR/lib/tools.jar" 2>/dev/null || true
+            "$JAVA_DIR/bin/keytool${EXE_EXT}" \
+                -genkeypair -keystore "$rel_ks" \
+                -alias "$ks_alias" -keyalg RSA -keysize 2048 -validity 9999 \
+                -storepass "$ks_pass" -keypass "$ks_pass" \
+                -dname "CN=${ks_cn},O=MyOrg,C=US" 2>/dev/null && \
+                lsuccess "  Release keystore created: $rel_ks"
+            keystore="$rel_ks"; alias="$ks_alias"; storepass="$ks_pass"; keypass="$ks_pass"
+        else
+            keystore="$ks_path"
+            echo -ne "  Alias: "; read -r alias
+            echo -ne "  Store password: "; read -rs storepass; echo ""
+            keypass="$storepass"
+        fi
+    else
+        # Debug signing
+        keystore="$TOOLS_DIR/tux-debug.keystore"
+        alias="tuxdebug"; storepass="tuxdebug"; keypass="tuxdebug"
+    fi
+
+    if [ -f "$TOOLS_DIR/apksig.jar" ] && [ -f "$keystore" ]; then
+        if sign_apk "$java_bin" "$unsigned" "$output_apk" "$keystore" "$alias" "$storepass" "$keypass"; then
+            lsuccess "  APK signed (v2 signature) ✓"
+        else
+            lwarn "  Signing failed — copying unsigned"
+            cp "$unsigned" "$output_apk"
+        fi
+    else
+        lwarn "  Signing skipped"
+        cp "$unsigned" "$output_apk"
+    fi
+
+    rm -rf "$build_dir"
+    log_line "OUTPUT: $output_apk"
+
+    echo ""
+    divider
+    echo -e "\n  ${GREEN}${BOLD}✓ APK [${mode}] built!${RESET}\n"
+    echo -e "  ${BOLD}File:${RESET}   ${CYAN}${output_apk}${RESET}"
+    echo -e "  ${BOLD}Size:${RESET}   $(du -sh "$output_apk" 2>/dev/null | cut -f1)"
+    echo -e "  ${BOLD}Package:${RESET}${DIM}${pkg_name}${RESET}"
+    echo -e "  ${BOLD}Log:${RESET}    ${DIM}${LOG_FILE}${RESET}"
+    echo ""
+    echo -e "  ${BOLD}Install:${RESET}    ${CYAN}adb install $(basename "$output_apk")${RESET}"
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  BUILD AAB (Android App Bundle)
+#  AAB = ZIP with special structure for Google Play
+# ══════════════════════════════════════════════════════════════════
+build_aab() {
+    local raw_files="$1"
+    print_banner
+    log_init "build_aab"
+    lstep "AAB build (Android App Bundle for Google Play)"
+    divider
+
+    [ -z "$raw_files" ] && { lerror "No files specified"; exit 1; }
+    IFS='+' read -ra FILES <<< "$raw_files"
+
+    lstep "Checking files..."
+    local all_ok=true
+    for i in "${!FILES[@]}"; do
+        FILES[$i]="$(echo "${FILES[$i]}" | xargs)"
+        [ -f "${FILES[$i]}" ] && lsuccess "  ${FILES[$i]}" || { lerror "  ${FILES[$i]} — not found"; all_ok=false; }
+    done
+    $all_ok || exit 1
+
+    local java_bin; java_bin="$(find_java)"
+    [ -z "$java_bin" ] && { lerror "Java not installed: tux install java"; exit 1; }
+    local kotlinc_bin; kotlinc_bin="$(find_kotlinc)"
+    [ -z "$kotlinc_bin" ] && { lerror "Kotlin not installed: tux install kotlin"; exit 1; }
+
+    ensure_apk_tools
+
+    local project_name
+    project_name="$(basename "${FILES[0]}" .kt | sed 's/[^a-zA-Z0-9_]//g')"
+    local pkg_name="com.tux.$(echo "$project_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g')"
+    local build_dir="$TMP_DIR/${project_name}_aab_$$"
+    local output_aab="$(pwd)/${project_name}.aab"
+
+    rm -rf "$build_dir"
+    # AAB structure: base/dex/  base/manifest/  base/res/  base/root/
+    mkdir -p \
+        "$build_dir/src" \
+        "$build_dir/aab/base/dex" \
+        "$build_dir/aab/base/manifest" \
+        "$build_dir/aab/base/res/layout" \
+        "$build_dir/aab/base/root"
+
+    for f in "${FILES[@]}"; do cp "$f" "$build_dir/src/"; done
+
+    # ── Шаг 1: Kotlin → JAR ──────────────────────────────────
+    lstep "Step 1/4 — Kotlin → JAR..."
+    local kt_files=()
+    for f in "${FILES[@]}"; do kt_files+=("$build_dir/src/$(basename "$f")"); done
+    set +e
+    "$kotlinc_bin" -classpath "$TOOLS_DIR/android.jar" \
+        "${kt_files[@]}" -include-runtime -d "$build_dir/app.jar" 2>&1 | \
+        while IFS= read -r l; do echo -e "    ${DIM}${l}${RESET}"; [ -n "$LOG_FILE" ] && log_line "$l"; done
+    local kc_rc=${PIPESTATUS[0]}
+    set -e
+    [ $kc_rc -ne 0 ] && { lerror "Compilation error"; rm -rf "$build_dir"; exit 1; }
+    lsuccess "  → app.jar"
+
+    # ── Шаг 2: JAR → DEX ─────────────────────────────────────
+    lstep "Step 2/4 — JAR → DEX (R8)..."
+    "$java_bin" -cp "$TOOLS_DIR/r8.jar" com.android.tools.r8.D8 \
+        --release --min-api 21 \
+        --lib "$TOOLS_DIR/android.jar" \
+        --output "$build_dir/aab/base/dex/" \
+        "$build_dir/app.jar" 2>/dev/null || \
+    "$java_bin" -cp "$TOOLS_DIR/r8.jar" com.android.tools.r8.D8 \
+        --min-api 21 --lib "$TOOLS_DIR/android.jar" \
+        --output "$build_dir/aab/base/dex/" "$build_dir/app.jar" || \
+        { lerror "DEX error"; rm -rf "$build_dir"; exit 1; }
+    lsuccess "  → classes.dex"
+
+    # ── Шаг 3: Манифест + метаданные AAB ─────────────────────
+    lstep "Step 3/4 — Creating AAB structure..."
+    local main_activity="MainActivity"
+    for f in "${FILES[@]}"; do
+        if grep -qE "class .+(Activity)" "$f" 2>/dev/null; then
+            local found; found=$(grep -oE 'class [A-Za-z]+' "$f" | head -1 | awk '{print $2}')
+            [ -n "$found" ] && main_activity="$found" && break
+        fi
+    done
+
+    gen_manifest "$build_dir/aab/base/manifest/AndroidManifest.xml" \
+        "$pkg_name" "$project_name" "$main_activity"
+
+    # BundleConfig.pb stub (protobuf, minimal)
+    # Create text version (bundletool can read)
+    cat > "$build_dir/aab/BundleConfig.json" << BCFG
+{
+    "bundletool": {"version": "1.15.0"},
+    "optimizations": {
+        "splitsConfig": {
+            "splitDimension": [
+                {"value": "ABI",      "negate": false, "suffixStripping": {"enabled": true}},
+                {"value": "SCREEN_DENSITY", "negate": false, "suffixStripping": {"enabled": true}},
+                {"value": "LANGUAGE", "negate": true}
+            ]
+        }
+    }
+}
+BCFG
+
+    # Minimal resources.pb (binary proto — empty)
+    printf '\x0a\x00' > "$build_dir/aab/base/resources.pb"
+
+    lsuccess "  → base/manifest/AndroidManifest.xml"
+    lsuccess "  → BundleConfig.json"
+
+    # ── Шаг 4: Упаковка AAB (ZIP) ────────────────────────────
+    lstep "Step 4/4 — Packing AAB..."
+    cd "$build_dir/aab"
+    local unsigned_aab="$build_dir/${project_name}-unsigned.aab"
+
+    if has_cmd zip; then
+        zip -qr "$unsigned_aab" base/ BundleConfig.json
+    elif has_cmd python3; then
+        python3 -c "
+import zipfile, os
+with zipfile.ZipFile('${unsigned_aab}','w',zipfile.ZIP_DEFLATED) as z:
+    for root,dirs,files in os.walk('base'):
+        for f in files: z.write(os.path.join(root,f))
+    z.write('BundleConfig.json')
+"
+    else
+        error "Need zip or python3"; cd - >/dev/null; exit 1
+    fi
+    cd - >/dev/null
+
+    # AAB signing
+    if [ -f "$TOOLS_DIR/apksig.jar" ] && [ -f "$TOOLS_DIR/tux-debug.keystore" ]; then
+        sign_apk "$java_bin" "$unsigned_aab" "$output_aab" \
+            "$TOOLS_DIR/tux-debug.keystore" "tuxdebug" "tuxdebug" "tuxdebug" && \
+            lsuccess "  AAB signed" || { lwarn "  AAB signing failed"; cp "$unsigned_aab" "$output_aab"; }
+    else
+        cp "$unsigned_aab" "$output_aab"
+    fi
+
+    rm -rf "$build_dir"
+    log_line "OUTPUT: $output_aab"
+
+    echo ""
+    divider
+    echo -e "\n  ${GREEN}${BOLD}✓ AAB built!${RESET}\n"
+    echo -e "  ${BOLD}File:${RESET}   ${CYAN}${output_aab}${RESET}"
+    echo -e "  ${BOLD}Size:${RESET}   $(du -sh "$output_aab" 2>/dev/null | cut -f1)"
+    echo -e "  ${BOLD}Package:${RESET}${DIM}${pkg_name}${RESET}"
+    echo -e "  ${BOLD}Log:${RESET}    ${DIM}${LOG_FILE}${RESET}"
+    echo ""
+    echo -e "  ${BOLD}Upload to Google Play:${RESET}"
+    echo -e "  ${DIM}  play.google.com/console → Release → Upload AAB${RESET}"
+    echo ""
+    echo -e "  ${BOLD}Test locally (bundletool):${RESET}"
+    echo -e "  ${CYAN}  bundletool build-apks --bundle=$(basename "$output_aab") --output=app.apks${RESET}"
+    echo -e "  ${CYAN}  bundletool install-apks --apks=app.apks${RESET}"
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  UPDATE TOOLS
+# ══════════════════════════════════════════════════════════════════
+update_tools() {
+    print_banner
+    step "Updating APK build tools..."
+    ensure_apk_tools "force"
+    success "Done!"
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  HELP
+# ══════════════════════════════════════════════════════════════════
+show_help() {
+    print_banner
+    echo -e "  ${BOLD}Install languages:${RESET}"
+    echo -e "    ${CYAN}tux install java${RESET}    ${DIM}Adoptium Temurin LTS${RESET}"
+    echo -e "    ${CYAN}tux install kotlin${RESET}  ${DIM}JetBrains (latest)${RESET}"
+    echo -e "    ${CYAN}tux install gradle${RESET}  ${DIM}latest stable${RESET}"
+    echo -e "    ${CYAN}tux install python${RESET}  ${DIM}latest stable${RESET}"
+    echo -e "    ${CYAN}tux install node${RESET}    ${DIM}Node.js LTS${RESET}"
+    echo ""
+    echo -e "  ${BOLD}Build:${RESET}"
+    echo -e "    ${CYAN}tux install apk Main.kt${RESET}              ${DIM}APK debug${RESET}"
+    echo -e "    ${CYAN}tux install apk Main.kt+B.kt release${RESET} ${DIM}APK release${RESET}"
+    echo -e "    ${CYAN}tux build aab Main.kt${RESET}                ${DIM}Android App Bundle${RESET}"
+    echo ""
+    echo -e "  ${BOLD}Other:${RESET}"
+    echo -e "    ${CYAN}tux self-install${RESET} ${DIM}add tux to terminal permanently${RESET}"
+    echo -e "    ${CYAN}tux list${RESET}         ${DIM}table of installed packages${RESET}"
+    echo -e "    ${CYAN}tux logs${RESET}         ${DIM}view build logs${RESET}"
+    echo -e "    ${CYAN}tux update-tools${RESET} ${DIM}update R8/apksig/android.jar${RESET}"
+    echo -e "    ${CYAN}tux version${RESET}      ${DIM}component versions${RESET}"
+    echo -e "    ${CYAN}tux ru${RESET}           ${DIM}switch menu to Russian${RESET}"
+    echo -e "    ${CYAN}tux en${RESET}           ${DIM}switch menu to English${RESET}"
+    echo ""
+    divider
+    echo -e "  ${DIM}Just run ${CYAN}tux${RESET}${DIM} for the interactive menu (↑↓ + Enter)${RESET}"
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  SELF-INSTALL — adds tux to PATH permanently
+# ══════════════════════════════════════════════════════════════════
+self_install() {
+    print_banner
+    step "Installing Tux to system"
+    divider
+
+    local SCRIPT_PATH
+    # Get absolute path to self
+    SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+    # Determine install location
+    local install_dir needs_sudo=false
+    if [ -d "/usr/local/bin" ] && [ -w "/usr/local/bin" ]; then
+        install_dir="/usr/local/bin"
+    elif [ -d "/usr/local/bin" ]; then
+        install_dir="/usr/local/bin"
+        needs_sudo=true
+    else
+        install_dir="$HOME/.local/bin"
+        mkdir -p "$install_dir"
+    fi
+
+    info "Installing to: ${BOLD}${install_dir}/tux${RESET}"
+
+    # Copy self to install_dir (if not already there)
+    if [ "$SCRIPT_PATH" != "$install_dir/tux" ]; then
+        if [ "$needs_sudo" = true ]; then
+            sudo cp "$SCRIPT_PATH" "$install_dir/tux"
+            sudo chmod +x "$install_dir/tux"
+        else
+            cp "$SCRIPT_PATH" "$install_dir/tux"
+            chmod +x "$install_dir/tux"
+        fi
+        success "tux copied to $install_dir/tux"
+    else
+        info "tux is already in $install_dir"
+    fi
+
+    # Add to PATH if needed
+    local needs_path=false
+    echo "$PATH" | grep -q "$install_dir" || needs_path=true
+
+    if [ "$needs_path" = true ]; then
+        info "Adding $install_dir to PATH..."
+        local export_line="export PATH=\"${install_dir}:\$PATH\""
+        local added=false
+        for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.bash_profile" "$HOME/.profile"; do
+            if [ -f "$rc" ] && ! grep -qF "$install_dir" "$rc"; then
+                { echo ""; echo "# Added by Tux"; echo "$export_line"; } >> "$rc"
+                success "  Added to $(basename "$rc")"
+                added=true
+            fi
+        done
+        # If no rc file — create .bashrc
+        if [ "$added" = false ] && [ ! -f "$HOME/.bashrc" ]; then
+            echo "$export_line" > "$HOME/.bashrc"
+            success "  Created ~/.bashrc"
+        fi
+        export PATH="$install_dir:$PATH"
+    fi
+
+    echo ""
+    divider
+    echo -e "\n  ${GREEN}${BOLD}✓ Tux installed!${RESET}\n"
+
+    if [ "$needs_path" = true ] && [ "$install_dir" = "$HOME/.local/bin" ]; then
+        echo -e "  ${YELLOW}Restart terminal or run:${RESET}"
+        echo -e "    ${CYAN}source ~/.bashrc${RESET}"
+        echo ""
+        echo -e "  Now just type ${BOLD}tux${RESET} in any terminal"
+    else
+        echo -e "  Now just type ${BOLD}tux${RESET} in any terminal — like python or git"
+    fi
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  VERSIONS
+# ══════════════════════════════════════════════════════════════════
+show_version() { show_list; }
+
+# ══════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ══════════════════════════════════════════════════════════════════
+main() {
+    case "${1:-}" in
+        install)
+            case "${2:-}" in
+                java)    install_java ;;
+                kotlin)  install_kotlin ;;
+                gradle)  install_gradle ;;
+                python)  install_python ;;
+                node)    install_node ;;
+                apk)
+                    [ -z "${3:-}" ] && { error "tux install apk Main.kt+B.kt [release]"; exit 1; }
+                    install_apk "$3" "${4:-debug}"
+                    ;;
+                "")  error "Specify package: java kotlin gradle python node apk"; exit 1 ;;
+                *)   error "Unknown package: '${2}'"; exit 1 ;;
+            esac ;;
+        build)
+            case "${2:-}" in
+                aab)
+                    [ -z "${3:-}" ] && { error "tux build aab Main.kt+B.kt"; exit 1; }
+                    build_aab "$3"
+                    ;;
+                *)  error "tux build aab <files>"; exit 1 ;;
+            esac ;;
+        list)              show_list ;;
+        logs)              show_logs ;;
+        update-tools)      update_tools ;;
+        self-install)      self_install ;;
+        version|--version) show_version ;;
+        help|--help|-h)    show_help ;;
+        ru)                exec env TUX_LANG=ru "$0" ;;
+        en)                exec env TUX_LANG=en "$0" ;;
+        "")                interactive_menu ;;  # Main menu with no arguments!
+        *)
+            error "Unknown command: '${1}'"
+            echo -e "  ${DIM}tux help${RESET}"
+            exit 1 ;;
+    esac
+}
+
+main "$@"
