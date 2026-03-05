@@ -4,7 +4,7 @@
 #   TUX — Package Manager & APK/AAB Builder  v3.0
 #   Поддержка: Linux · Windows (Git Bash/MSYS2/WSL) · macOS
 #
-#   Новое в v3.0:
+#   Новое в v3.0.0:
 #     • Интерактивное меню (просто запусти: tux)
 #     • Новые языки: Gradle, Python, Node.js
 #     • Сборка AAB (Android App Bundle для Google Play)
