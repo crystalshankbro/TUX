@@ -219,7 +219,7 @@ interactive_menu() {
     )
     # Categories (EN)
     local CATEGORIES_EN=(
-        "🔨  Build APK / AAB"
+        "🔨  Install"
         "📋  tux list — installed packages"
         "📄  Build logs"
         "🔧  Update APK tools"
