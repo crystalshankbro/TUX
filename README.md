@@ -24,7 +24,7 @@
 
 <!-- ENGLISH -->
 
-# 🇬🇧 English
+# EN English
 
 ## Table of Contents
 
